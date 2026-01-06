@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Brains - Zombie Tag</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0e14;
+            color: #e0e0e0;
+            font-family: system-ui, -apple-system, sans-serif;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        canvas { border: 2px solid #1a1f2e; background: #16213e; cursor: crosshair; }
+        #ui {
+            position: fixed; top: 20px; left: 20px;
+            background: rgba(0, 0, 0, 0.8); padding: 15px; border-radius: 8px;
+            backdrop-filter: blur(5px); min-width: 200px;
+        }
+        #ui h2 { color: #4ecdc4; font-size: 18px; margin-bottom: 10px; }
+        .phase { color: #ffd700; font-weight: bold; margin: 8px 0; }
+        .team-humans { color: #4ecdc4; }
+        .team-zombies { color: #e94560; }
+        #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #4ecdc4; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading game...</div>
+    <canvas id="game"></canvas>
+    <div id="ui" style="display: none;">
+        <h2>Brains</h2>
+        <div class="phase" id="phase">Waiting...</div>
+        <div id="score"></div>
+    </div>
+
+<script>
+// ====================================================================
+// MIGRATED TO NEW ECS API (2025-01-05)
+// Original: Old Entity2D API with Modu.init()
+// New: ECS API with createGame() and plugins
+// ====================================================================
+
+// Load SDK based on environment (EXACT same as modu-cell)
+(function () {
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const script = document.createElement('script');
+
+    if (isLocalhost) {
+        script.src = 'http://localhost:3001/dist/modu.iife.js?v=dev';
+    } else {
+        // Use production CDN with dynamic version for cache busting
+        const version = Date.now();
+        script.src = `https://cdn.moduengine.com/modu.iife.js?v=${version}`;
+    }
+
+    script.onload = initGame;
+    document.head.appendChild(script);
+})();
+
+async function initGame() {
+    // Load game.json
+    const res = await fetch('brains.json');
+    const cfg = (await res.json()).game;
+    const TILE = cfg.metadata.tileSize;
+    const MAP_W = cfg.map.width * TILE, MAP_H = cfg.map.height * TILE;
+
+    const canvas = document.getElementById('game');
+    canvas.width = Math.min(MAP_W, window.innerWidth - 40);
+    canvas.height = Math.min(MAP_H, window.innerHeight - 40);
+
+    // NEW ECS API: createGame() instead of Modu.init()
+    const game = createGame();
+
+    // NEW: Add plugins instead of direct instantiation
+    const physics = game.addPlugin(Physics2DSystem, { gravity: { x: 0, y: 0 } });
+    const renderer = game.addPlugin(Simple2DRenderer, canvas);
+    window.game = game;
+
+    // Camera state - start at map center
+    let cameraX = MAP_W / 2, cameraY = MAP_H / 2;
+    let targetCameraX = cameraX, targetCameraY = cameraY;
+    const CAMERA_SMOOTHING = 0.15; // Adjust this value (0.05-0.3 typically works well)
+
+    // ====================================================================
+    // DEFINE CUSTOM COMPONENTS (NEW ECS API)
+    // Components hold all game state - must be defined before entities
+    // Note: Use plain numbers or { type: 'f32', default: 0 } only
+    // ====================================================================
+
+    // Team types: 0=human, 1=zombie, 2=sick
+    const TEAM_HUMAN = 0;
+    const TEAM_ZOMBIE = 1;
+    const TEAM_SICK = 2;
+
+    const TeamComponent = defineComponent('Team', {
+        team: 0,  // 0=human, 1=zombie, 2=sick
+        score: 0,
+        aimAngle: { type: 'f32', default: 0 }
+    });
+
+    const TileData = defineComponent('TileData', {
+        tileId: 0
+    });
+
+    const FurnitureData = defineComponent('FurnitureData', {
+        spriteUrlId: 0,  // Interned string ID
+        w: { type: 'f32', default: 64 },
+        h: { type: 'f32', default: 64 },
+        angle: { type: 'f32', default: 0 }
+    });
+
+    // Game constants
+    const HUMAN_SPEED = cfg.entityTypes.player.human.speed;
+    const ZOMBIE_SPEED = cfg.entityTypes.player.zombie.speed;
+    const SICK_SPEED = cfg.entityTypes.player.sick.speed;
+    const PLAYER_RADIUS = cfg.entityTypes.player.human.width * TILE;  // Use full width as diameter
+    const INFECTION_DIST = 1.2 * TILE;
+
+    // Sprites
+    const sprites = new Map();
+    async function loadSprite(url) {
+        if (sprites.has(url)) return sprites.get(url);
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = () => { sprites.set(url, img); resolve(img); };
+            img.onerror = () => { console.warn('[Brains] Failed to load:', url); resolve(null); };
+            img.src = url;
+        });
+    }
+
+    // Load tilesheet
+    const tilesheetInfo = cfg.map.tilesets?.[0];
+    const tilesheetImg = tilesheetInfo ? await loadSprite(tilesheetInfo.localImage) : null;
+    const TILE_COLS = tilesheetInfo?.columns || 1;
+
+    // Preload player sprites
+    await Promise.all([
+        loadSprite(cfg.entityTypes.player.human.sprite),
+        loadSprite(cfg.entityTypes.player.zombie.sprite),
+        loadSprite(cfg.entityTypes.player.sick.sprite)
+    ]);
+
+    // Load furniture sprites (background)
+    Object.values(cfg.entityTypes.furniture || {}).forEach(f => {
+        if (f.sprite) loadSprite(f.sprite);
+    });
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('ui').style.display = 'block';
+
+    // ====================================================================
+    // DEFINE ENTITY TYPES (NEW ECS API)
+    // ====================================================================
+
+    // Floor tiles - visual only, sensor body
+    game.defineEntity('_floor')
+        .with(Transform2D)
+        .with(Sprite, { shape: SHAPE_RECT, width: TILE, height: TILE, layer: 0, visible: false })
+        .with(Body2D, { shapeType: SHAPE_RECT, width: TILE, height: TILE, bodyType: BODY_STATIC, isSensor: true })
+        .with(TileData)
+        .register();
+
+    // Walls - solid collision
+    game.defineEntity('wall')
+        .with(Transform2D)
+        .with(Sprite, { shape: SHAPE_RECT, width: TILE, height: TILE, layer: 1, visible: false })
+        .with(Body2D, { shapeType: SHAPE_RECT, width: TILE, height: TILE, bodyType: BODY_STATIC })
+        .with(TileData)
+        .register();
+
+    // Furniture - dynamic physics objects (pushable)
+    game.defineEntity('furniture')
+        .with(Transform2D)
+        .with(Sprite, { shape: SHAPE_RECT, layer: 2, visible: false })
+        .with(Body2D, {
+            shapeType: SHAPE_RECT,
+            bodyType: BODY_DYNAMIC,  // Changed from STATIC to DYNAMIC for pushable furniture
+            mass: 5,                 // Default mass, will be overridden per furniture type
+            restitution: 0.2,        // Slight bounce when hit
+            friction: 0.5,           // Some friction for realistic pushing
+            damping: 0.15,           // Reduced damping for more realistic movement
+            width: TILE,             // Default width, will be overridden
+            height: TILE             // Default height, will be overridden
+        })
+        .with(FurnitureData)
+        .register();
+
+    // Player - kinematic body with team data
+    game.defineEntity('player')
+        .with(Transform2D)
+        .with(Sprite, { shape: SHAPE_CIRCLE, radius: PLAYER_RADIUS, layer: 3 })
+        .with(Body2D, { shapeType: SHAPE_CIRCLE, radius: PLAYER_RADIUS, bodyType: BODY_KINEMATIC })
+        .with(Player)
+        .with(TeamComponent)
+        .register();
+
+    // Game state constants
+    const TICK_RATE = 20;
+    const TIME_PREOUTBREAK = 60 * TICK_RATE;
+    const TIME_SICK = 15 * TICK_RATE;
+    const OUTBREAK_RATIO = 0.3;
+
+    // Global game state (stored on first player to ensure synchronization)
+    let gameState = {
+        gamePhase: 'waiting',
+        gamePhaseStartTick: 0,
+        gameSickInfectionTick: 0,
+        gameOutbreakTick: 0,
+        gameTick: 0
+    };
+
+    function getGameState() {
+        const players = Array.from(game.query('player')).sort((a, b) =>
+            (a.get(Player).clientId || 0) - (b.get(Player).clientId || 0)
+        );
+        if (players.length === 0) return null;
+
+        const firstPlayer = players[0];
+        const sprite = firstPlayer.get(Sprite);
+
+        // Store state in sprite.color as interned value (hacky but works for sync)
+        if (!sprite.gamePhase) {
+            sprite.gamePhase = 'waiting';
+            sprite.gamePhaseStartTick = 0;
+            sprite.gameSickInfectionTick = 0;
+            sprite.gameOutbreakTick = 0;
+            sprite.gameTick = 0;
+        }
+        return sprite;
+    }
+
+    // ====================================================================
+    // CUSTOM RENDERER (Override Simple2DRenderer render method)
+    // ====================================================================
+    const originalRender = renderer.render.bind(renderer);
+    renderer.render = function() {
+        const ctx = renderer.context;
+        const alpha = game.getRenderAlpha();
+
+        // Update camera position BEFORE rendering with smoothing
+        const localClientId = game.localClientId;
+        let localPlayer = null;
+        if (localClientId) {
+            // Use the built-in method to find the local player
+            localPlayer = game.getEntityByClientId(localClientId);
+            if (localPlayer && !localPlayer.destroyed) {
+                // Use interpolated position for smoother camera movement
+                localPlayer.interpolate(alpha);
+                targetCameraX = localPlayer.render.interpX;
+                targetCameraY = localPlayer.render.interpY;
+
+                // Apply exponential smoothing to camera position
+                cameraX += (targetCameraX - cameraX) * CAMERA_SMOOTHING;
+                cameraY += (targetCameraY - cameraY) * CAMERA_SMOOTHING;
+            }
+        }
+
+        // Clear canvas
+        ctx.fillStyle = '#0a0e14';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Apply camera transform
+        ctx.save();
+        ctx.translate(canvas.width / 2 - cameraX, canvas.height / 2 - cameraY);
+        ctx.imageSmoothingEnabled = false;
+
+        // Render all entities with custom drawing
+        const entities = Array.from(game.getAllEntities()).filter(e => !e.destroyed);
+
+        // Sort by layer for proper rendering order
+        entities.sort((a, b) => {
+            const aLayer = a.has(Sprite) ? a.get(Sprite).layer : 0;
+            const bLayer = b.has(Sprite) ? b.get(Sprite).layer : 0;
+            return aLayer - bLayer;
+        });
+
+        for (const entity of entities) {
+            if (entity.destroyed) continue;
+
+            // Interpolate position (skip if already interpolated for camera)
+            if (entity !== localPlayer) {
+                entity.interpolate(alpha);
+            }
+            const pos = { x: entity.render.interpX, y: entity.render.interpY };
+
+            // Custom drawing per entity type
+            const type = entity.type;
+
+            // Floor tiles
+            if (type === '_floor' && entity.has(TileData)) {
+                const tileData = entity.get(TileData);
+                if (tilesheetImg && tileData.tileId) {
+                    const tileId = tileData.tileId - 1;
+                    const srcX = (tileId % TILE_COLS) * TILE;
+                    const srcY = Math.floor(tileId / TILE_COLS) * TILE;
+                    ctx.drawImage(tilesheetImg, srcX, srcY, TILE, TILE, pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+                } else {
+                    ctx.fillStyle = '#1a2332';
+                    ctx.fillRect(pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+                }
+                continue;
+            }
+
+            // Walls
+            if (type === 'wall' && entity.has(TileData)) {
+                const tileData = entity.get(TileData);
+                if (tilesheetImg && tileData.tileId) {
+                    const tileId = tileData.tileId - 1;
+                    const srcX = (tileId % TILE_COLS) * TILE;
+                    const srcY = Math.floor(tileId / TILE_COLS) * TILE;
+                    ctx.drawImage(tilesheetImg, srcX, srcY, TILE, TILE, pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+                } else {
+                    ctx.fillStyle = '#2c3e50';
+                    ctx.fillRect(pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+                }
+                continue;
+            }
+
+            // Furniture
+            if (type === 'furniture' && entity.has(FurnitureData)) {
+                const furnitureData = entity.get(FurnitureData);
+                const transform = entity.get(Transform2D);
+                const spriteUrl = game.getString('spriteUrl', furnitureData.spriteUrlId);
+                const sprite = sprites.get(spriteUrl);
+                const w = furnitureData.w;
+                const h = furnitureData.h;
+                // Use Transform2D angle (in radians, updated by physics) instead of static FurnitureData angle
+                const angle = transform ? transform.angle : 0;
+
+                ctx.save();
+                ctx.translate(pos.x, pos.y);
+                if (angle) ctx.rotate(angle); // Already in radians from Transform2D
+                if (sprite) {
+                    ctx.drawImage(sprite, -w / 2, -h / 2, w, h);
+                } else {
+                    ctx.fillStyle = '#7f8c8d';
+                    ctx.fillRect(-w / 2, -h / 2, w, h);
+                }
+                ctx.restore();
+                continue;
+            }
+
+            // Players
+            if (type === 'player' && entity.has(TeamComponent)) {
+                const teamComp = entity.get(TeamComponent);
+                const teamNum = teamComp.team;
+                // Convert team number to string: 0=human, 1=zombie, 2=sick
+                const teamName = teamNum === TEAM_ZOMBIE ? 'zombie' : teamNum === TEAM_SICK ? 'sick' : 'human';
+                const teamConfig = cfg.entityTypes.player[teamName];
+                const sprite = sprites.get(teamConfig?.sprite);
+                const color = teamConfig?.color || '#fff';
+                const aimAngle = teamComp.aimAngle;
+
+                ctx.save();
+                ctx.translate(pos.x, pos.y);
+                ctx.rotate(aimAngle);
+
+                if (sprite) {
+                    ctx.drawImage(sprite, -PLAYER_RADIUS, -PLAYER_RADIUS, PLAYER_RADIUS * 2, PLAYER_RADIUS * 2);
+                } else {
+                    // Fallback: colored circle
+                    ctx.beginPath();
+                    ctx.arc(0, 0, PLAYER_RADIUS, 0, Math.PI * 2);
+                    ctx.fillStyle = color;
+                    ctx.fill();
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+
+                    // Direction indicator
+                    ctx.fillStyle = '#fff';
+                    ctx.beginPath();
+                    ctx.moveTo(PLAYER_RADIUS * 0.5, 0);
+                    ctx.lineTo(PLAYER_RADIUS * 0.8, -PLAYER_RADIUS * 0.2);
+                    ctx.lineTo(PLAYER_RADIUS * 0.8, PLAYER_RADIUS * 0.2);
+                    ctx.fill();
+                }
+
+                ctx.restore();
+            }
+        }
+
+        ctx.restore();
+    };
+
+    // ====================================================================
+    // INPUT SYSTEM (NEW ECS API)
+    // ====================================================================
+    const input = game.addPlugin(InputPlugin, canvas);
+    input.action('move', { type: 'vector', bindings: ['keys:wasd', 'keys:arrows'] });
+    input.action('aim', { type: 'vector', bindings: ['mouse'] });
+
+    // ====================================================================
+    // CAMERA SYSTEM - Now handled directly in renderer.render() above
+    // ====================================================================
+    // Removed: Camera update moved into custom renderer for proper timing
+
+    // ====================================================================
+    // CALLBACKS (Migrated to new spawn pattern)
+    // ====================================================================
+    const callbacks = {
+        onRoomCreate() {
+            // Create floor tiles
+            const floorLayer = cfg.map.layers.find(l => l.name === 'floor' || l.name.includes('floor'));
+            if (floorLayer) {
+                for (let i = 0; i < floorLayer.data.length; i++) {
+                    if (floorLayer.data[i] !== 0) {
+                        const tx = (i % cfg.map.width) * TILE + TILE / 2;
+                        const ty = Math.floor(i / cfg.map.width) * TILE + TILE / 2;
+                        game.spawn('_floor', { x: tx, y: ty, tileId: floorLayer.data[i] });
+                    }
+                }
+            }
+
+            // Create walls
+            const wallLayer = cfg.map.layers.find(l => l.name === 'walls' || l.name === 'collision');
+            if (wallLayer) {
+                for (let i = 0; i < wallLayer.data.length; i++) {
+                    if (wallLayer.data[i] !== 0) {
+                        const tx = (i % cfg.map.width) * TILE + TILE / 2;
+                        const ty = Math.floor(i / cfg.map.width) * TILE + TILE / 2;
+                        game.spawn('wall', { x: tx, y: ty, tileId: wallLayer.data[i] });
+                    }
+                }
+            }
+
+            // Create furniture
+            cfg.initialEntities.forEach(e => {
+                const type = cfg.entityTypes.furniture[e.type];
+                const w = (e.width || type.width) * TILE;
+                const h = (e.height || type.height) * TILE;
+                const x = e.x * TILE;
+                const y = e.y * TILE;
+                const spriteUrlId = game.internString('spriteUrl', type.sprite);
+                const angleDegrees = e.angle || 0;
+                const angleRadians = (angleDegrees * Math.PI) / 180; // Convert degrees to radians for Transform2D
+
+                // Calculate mass based on furniture size (larger = heavier)
+                const area = (w * h) / (TILE * TILE); // Area in tiles
+                let mass = 2 + area * 0.5; // Base mass + size factor
+
+                // Make certain furniture types heavier
+                if (e.type === 'sofa' || e.type === 'couch' || e.type === 'bigTable' || e.type === 'bed' || e.type === 'tank') {
+                    mass *= 2; // These are extra heavy
+                } else if (e.type === 'tv' || e.type === 'smallTable') {
+                    mass *= 1.5; // Medium weight
+                }
+                // Small chairs and boxes remain lighter (default mass calculation)
+
+                const furniture = game.spawn('furniture', {
+                    x, y,
+                    angle: angleRadians,  // Set Transform2D angle in radians
+                    spriteUrlId,
+                    w, h,                // FurnitureData dimensions for rendering
+                    width: w,            // Body2D width for physics
+                    height: h,           // Body2D height for physics
+                    mass: mass,          // Dynamic mass based on furniture type/size
+                    angularVelocity: 0   // Initialize angular velocity
+                });
+
+                // Ensure Body2D dimensions and physics properties are properly set
+                const body = furniture.get(Body2D);
+                if (body) {
+                    body.width = w;
+                    body.height = h;
+                    body.mass = mass;
+                    body.angularVelocity = 0; // Initialize angular velocity
+                    // Log the body type to verify it's dynamic
+                    console.log(`Created furniture: type=${e.type}, bodyType=${body.bodyType} (should be ${BODY_DYNAMIC} for dynamic), mass=${mass.toFixed(2)}`);
+                }
+
+                // Store rendering dimensions in FurnitureData
+                const furnitureData = furniture.get(FurnitureData);
+                if (furnitureData) {
+                    furnitureData.angle = angleDegrees;
+                    furnitureData.w = w;
+                    furnitureData.h = h;
+                }
+            });
+
+            gameState.gamePhase = 'waiting';
+        },
+
+        onConnect(clientId) {
+            const spawn = cfg.regions.spawn;
+            const x = (spawn.x + dRandom() * spawn.width) * TILE;
+            const y = (spawn.y + dRandom() * spawn.height) * TILE;
+
+            const player = game.spawn('player', {
+                x, y,
+                clientId,
+                team: TEAM_HUMAN,  // Use numeric constant
+                score: 0,
+                aimAngle: 0
+            });
+        },
+
+        onDisconnect(clientId) {
+            game.getEntityByClientId(clientId)?.destroy();
+        }
+    };
+
+    // ====================================================================
+    // GAME SYSTEMS (NEW ECS API - replaces onTick)
+    // ====================================================================
+
+    // Movement and aiming system
+    game.addSystem(() => {
+        for (const player of game.query('player')) {
+            const playerComp = player.get(Player);
+            const teamComp = player.get(TeamComponent);
+            const transform = player.get(Transform2D);
+            const inputData = game.world.getInput(playerComp.clientId);
+
+            // Camera update is now in render loop (see renderer.render above)
+
+            if (!inputData) continue;
+
+            // Movement with WASD (using same approach as 2d-shooter)
+            if (inputData.move && (inputData.move.x !== 0 || inputData.move.y !== 0)) {
+                const mx = inputData.move.x > 0 ? 1 : inputData.move.x < 0 ? -1 : 0;
+                const my = inputData.move.y > 0 ? 1 : inputData.move.y < 0 ? -1 : 0;
+
+                const scoreMultiplier = 1 + teamComp.score / 30000;
+                let speed;
+                if (teamComp.team === TEAM_HUMAN) {
+                    speed = HUMAN_SPEED * scoreMultiplier;
+                } else if (teamComp.team === TEAM_ZOMBIE) {
+                    speed = ZOMBIE_SPEED * scoreMultiplier;
+                } else {
+                    speed = SICK_SPEED * scoreMultiplier;
+                }
+
+                let vx = mx * speed * 60;
+                let vy = my * speed * 60;
+
+                // Normalize diagonal movement using fixed-point math
+                if (mx !== 0 && my !== 0) {
+                    const INV_SQRT2 = 46341; // 0.7071 * 65536
+                    vx = toFloat(fpMul(toFixed(vx), INV_SQRT2));
+                    vy = toFloat(fpMul(toFixed(vy), INV_SQRT2));
+                }
+
+                player.setVelocity(vx, vy);
+            } else {
+                player.setVelocity(0, 0);
+            }
+
+            // Aiming with mouse (convert canvas coords to world coords)
+            if (inputData.aim) {
+                // Mouse comes in canvas coordinates, convert to world coordinates
+                const worldX = inputData.aim.x + cameraX - canvas.width / 2;
+                const worldY = inputData.aim.y + cameraY - canvas.height / 2;
+                const dx = worldX - transform.x;
+                const dy = worldY - transform.y;
+                teamComp.aimAngle = Math.atan2(dy, dx) + Math.PI / 2;
+            }
+        }
+    }, { phase: 'update' });
+
+    // Game phase management system
+    game.addSystem(() => {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gameTick++;
+
+        const players = Array.from(game.query('player'));
+
+        // Auto-start round when 2+ players join
+        if (state.gamePhase === 'waiting' && players.length >= 2) {
+            startRound();
+        }
+
+        // Phase transitions
+        const ticksInPhase = state.gameTick - state.gamePhaseStartTick;
+
+        if (state.gamePhase === 'preoutbreak') {
+            // Make players sick 45 seconds in
+            if (state.gameSickInfectionTick === 0 && ticksInPhase >= (TIME_PREOUTBREAK - TIME_SICK)) {
+                makeSomePlayersSick();
+            }
+
+            // Start outbreak at 60 seconds
+            if (ticksInPhase >= TIME_PREOUTBREAK) {
+                startOutbreak();
+            }
+        }
+
+        if (state.gamePhase === 'postoutbreak') {
+            // Check win conditions
+            const humans = players.filter(p => p.get(TeamComponent).team === TEAM_HUMAN).length;
+            const zombies = players.filter(p => p.get(TeamComponent).team === TEAM_ZOMBIE).length;
+
+            if (humans === 0 && zombies > 0) {
+                endRound('zombies');
+            } else if (zombies === 0 && humans > 0) {
+                endRound('humans');
+            }
+        }
+
+        updateUI();
+    }, { phase: 'update' });
+
+    // Infection system
+    game.addSystem(() => {
+        const state = getGameState();
+        if (!state || state.gamePhase !== 'postoutbreak') return;
+
+        const players = Array.from(game.query('player'));
+
+        for (const zombie of players) {
+            const zombieTeam = zombie.get(TeamComponent);
+            if (zombieTeam.team !== TEAM_ZOMBIE) continue;
+
+            const zombieTransform = zombie.get(Transform2D);
+
+            for (const human of players) {
+                const humanTeam = human.get(TeamComponent);
+                if (humanTeam.team !== TEAM_HUMAN) continue;
+
+                const humanTransform = human.get(Transform2D);
+                const dx = zombieTransform.x - humanTransform.x;
+                const dy = zombieTransform.y - humanTransform.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist < INFECTION_DIST) {
+                    humanTeam.team = TEAM_ZOMBIE;
+                    zombieTeam.score++;
+                }
+            }
+        }
+    }, { phase: 'update' });
+
+    // ====================================================================
+    // COLLISION HANDLERS
+    // ====================================================================
+
+    // Player-furniture collision: Apply extra push force for better responsiveness
+    game.onCollision('player', 'furniture', (player, furniture) => {
+        const playerTransform = player.get(Transform2D);
+        const furnitureTransform = furniture.get(Transform2D);
+        const furnitureBody = furniture.get(Body2D);
+        const playerBody = player.get(Body2D);
+        const furnitureData = furniture.get(FurnitureData);
+
+        if (!playerTransform || !furnitureTransform || !furnitureBody || !playerBody) return;
+
+        // Skip if player is not moving
+        const playerSpeed = Math.sqrt(playerBody.vx * playerBody.vx + playerBody.vy * playerBody.vy);
+        if (playerSpeed < 10) return; // Minimum speed threshold
+
+        // Get furniture dimensions for better collision point calculation
+        const furnitureWidth = furnitureData ? furnitureData.w : TILE;
+        const furnitureHeight = furnitureData ? furnitureData.h : TILE;
+
+        // Calculate the collision point on the furniture's edge
+        // This is more accurate than using the player's center
+        const relX = playerTransform.x - furnitureTransform.x;
+        const relY = playerTransform.y - furnitureTransform.y;
+
+        // Clamp the collision point to the furniture's boundaries
+        const halfWidth = furnitureWidth / 2;
+        const halfHeight = furnitureHeight / 2;
+        const collisionX = Math.max(-halfWidth, Math.min(halfWidth, relX));
+        const collisionY = Math.max(-halfHeight, Math.min(halfHeight, relY));
+
+        // Calculate push direction (from player to furniture)
+        const dx = furnitureTransform.x - playerTransform.x;
+        const dy = furnitureTransform.y - playerTransform.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > 0.01) { // Avoid division by zero
+            // Push force based on player movement
+            const pushStrength = Math.min(playerSpeed * 0.4, 120);
+            const pushX = (dx / dist) * pushStrength;
+            const pushY = (dy / dist) * pushStrength;
+
+            // Apply linear impulse
+            furnitureBody.impulseX += pushX;
+            furnitureBody.impulseY += pushY;
+
+            // Calculate torque using the actual push force and collision point
+            // Torque = r × F (cross product of position vector and force vector)
+            // The sign determines rotation direction:
+            // Positive = counterclockwise, Negative = clockwise
+            const torque = (collisionX * pushY - collisionY * pushX) * 0.00001; // Reduced scale factor for reasonable values
+
+            // Apply angular velocity with mass consideration
+            // Heavier furniture should rotate less
+            const massEffect = 3 / (furnitureBody.mass || 5);
+            const adjustedTorque = torque * massEffect;
+
+            // Use much smaller max angular velocity (0.5 radians/second = ~30 degrees/second)
+            const maxAngularVelocity = 0.5;
+            const currentAngVel = furnitureBody.angularVelocity || 0;
+            const newAngularVelocity = currentAngVel + adjustedTorque;
+            furnitureBody.angularVelocity = Math.max(-maxAngularVelocity,
+                Math.min(maxAngularVelocity, newAngularVelocity));
+
+            // Debug logging
+            console.log(`Collision: point(${collisionX.toFixed(1)}, ${collisionY.toFixed(1)}), ` +
+                       `force(${pushX.toFixed(1)}, ${pushY.toFixed(1)}), torque=${torque.toFixed(5)}, ` +
+                       `adjustedTorque=${adjustedTorque.toFixed(5)}, ` +
+                       `currentAngVel=${currentAngVel.toFixed(5)} -> newAngVel=${furnitureBody.angularVelocity.toFixed(5)}`);
+        }
+    });
+
+    // ====================================================================
+    // HELPER FUNCTIONS (Updated to use new ECS API)
+    // ====================================================================
+    function startRound() {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gamePhase = 'preoutbreak';
+        state.gamePhaseStartTick = state.gameTick;
+        state.gameSickInfectionTick = 0;
+        state.gameOutbreakTick = 0;
+
+        // Reset ALL players to human
+        for (const player of game.query('player')) {
+            const teamComp = player.get(TeamComponent);
+            teamComp.team = TEAM_HUMAN;
+            teamComp.score = 0;
+        }
+    }
+
+    function makeSomePlayersSick() {
+        const state = getGameState();
+        if (!state) return;
+
+        const players = Array.from(game.query('player'));
+
+        // Sort for determinism
+        const humans = players
+            .filter(p => p.get(TeamComponent).team === TEAM_HUMAN)
+            .sort((a, b) => (a.get(Player).clientId || 0) - (b.get(Player).clientId || 0));
+
+        const numToInfect = Math.max(1, Math.floor(humans.length * OUTBREAK_RATIO));
+
+        // Deterministic shuffle using tick number
+        const shuffled = [...humans];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = (state.gameTick + i) % (i + 1);
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+
+        for (let i = 0; i < numToInfect && i < shuffled.length; i++) {
+            shuffled[i].get(TeamComponent).team = TEAM_SICK;
+        }
+
+        state.gameSickInfectionTick = state.gameTick;
+    }
+
+    function startOutbreak() {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gamePhase = 'postoutbreak';
+        state.gameOutbreakTick = state.gameTick;
+
+        // Convert all sick players to zombies
+        for (const player of game.query('player')) {
+            const teamComp = player.get(TeamComponent);
+            if (teamComp.team === TEAM_SICK) {
+                teamComp.team = TEAM_ZOMBIE;
+            }
+        }
+    }
+
+    function endRound(winner) {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gamePhase = 'ended';
+        setTimeout(() => {
+            const players = Array.from(game.query('player'));
+            if (players.length >= 2) startRound();
+            else {
+                const s = getGameState();
+                if (s) s.gamePhase = 'waiting';
+            }
+        }, 5000);
+    }
+
+    function updateUI() {
+        const state = getGameState();
+        if (!state) return;
+
+        const players = Array.from(game.query('player'));
+        const humans = players.filter(p => p.get(TeamComponent).team === TEAM_HUMAN).length;
+        const zombies = players.filter(p => p.get(TeamComponent).team === TEAM_ZOMBIE).length;
+        const sick = players.filter(p => p.get(TeamComponent).team === TEAM_SICK).length;
+
+        const phaseEl = document.getElementById('phase');
+        const ticksInPhase = (state.gameTick || 0) - (state.gamePhaseStartTick || 0);
+
+        if (state.gamePhase === 'waiting') {
+            phaseEl.textContent = 'Waiting for players...';
+        } else if (state.gamePhase === 'preoutbreak') {
+            const secondsLeft = Math.max(0, Math.ceil((TIME_PREOUTBREAK - ticksInPhase) / TICK_RATE));
+            phaseEl.innerHTML = `Pre-outbreak: ${secondsLeft}s | <span class="team-humans">Humans: ${humans}</span> | Sick: ${sick}`;
+        } else if (state.gamePhase === 'postoutbreak') {
+            phaseEl.innerHTML = `<span class="team-humans">Humans: ${humans}</span> | <span class="team-zombies">Zombies: ${zombies}</span>`;
+        } else {
+            phaseEl.textContent = 'Round ended!';
+        }
+    }
+
+    // ====================================================================
+    // CONNECT TO SERVER
+    // ====================================================================
+    game.connect('brains', callbacks);
+    Modu.enableDebugUI(game);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Brains - Zombie Tag</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0e14;
+            color: #e0e0e0;
+            font-family: system-ui, -apple-system, sans-serif;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        canvas { border: 2px solid #1a1f2e; background: #16213e; cursor: crosshair; }
+        #ui {
+            position: fixed; top: 20px; left: 20px;
+            background: rgba(0, 0, 0, 0.8); padding: 15px; border-radius: 8px;
+            backdrop-filter: blur(5px); min-width: 200px;
+        }
+        #ui h2 { color: #4ecdc4; font-size: 18px; margin-bottom: 10px; }
+        .phase { color: #ffd700; font-weight: bold; margin: 8px 0; }
+        .team-humans { color: #4ecdc4; }
+        .team-zombies { color: #e94560; }
+        #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #4ecdc4; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading game...</div>
+    <canvas id="game"></canvas>
+    <div id="ui" style="display: none;">
+        <h2>Brains</h2>
+        <div class="phase" id="phase">Waiting...</div>
+        <div id="score"></div>
+    </div>
+
+<script src="../dist/modu.iife.js?v=dev"></script>
+<script>
+(async () => {
+    // Load game.json
+    const res = await fetch('brains-game.json');
+    const cfg = (await res.json()).game;
+    const TILE = cfg.metadata.tileSize;
+    const MAP_W = cfg.map.width * TILE, MAP_H = cfg.map.height * TILE;
+
+    const canvas = document.getElementById('game');
+    canvas.width = Math.min(MAP_W, window.innerWidth - 40);
+    canvas.height = Math.min(MAP_H, window.innerHeight - 40);
+
+    const game = Modu.init();
+    game.physics = new Physics2D({ gravity: { x: 0, y: 0 } });
+    window.game = game;
+    const renderer = new CanvasRenderer('#game', {
+        background: '#0a0e14',  // Dark background (fallback for areas outside map)
+        gridColor: null
+    });
+
+    // Camera state
+    let cameraX = MAP_W / 2, cameraY = MAP_H / 2;
+
+    // Wrap renderEntity to add camera transform
+    const originalRenderEntity = renderer.renderEntity.bind(renderer);
+    renderer.renderEntity = function(entity, alpha) {
+        const ctx = renderer.ctx;
+        ctx.save();
+        ctx.translate(canvas.width / 2 - cameraX, canvas.height / 2 - cameraY);
+        originalRenderEntity(entity, alpha);
+        ctx.restore();
+    };
+
+    // Game constants
+    const HUMAN_SPEED = cfg.entityTypes.player.human.speed;
+    const ZOMBIE_SPEED = cfg.entityTypes.player.zombie.speed;
+    const SICK_SPEED = cfg.entityTypes.player.sick.speed;
+    const PLAYER_RADIUS = cfg.entityTypes.player.human.width * TILE;  // Use full width as diameter
+    const INFECTION_DIST = 1.2 * TILE;
+
+    // Sprites
+    const sprites = new Map();
+    async function loadSprite(url) {
+        if (sprites.has(url)) return sprites.get(url);
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = () => { sprites.set(url, img); resolve(img); };
+            img.onerror = () => { console.warn('[Brains] Failed to load:', url); resolve(null); };
+            img.src = url;
+        });
+    }
+
+    // Load tilesheet
+    const tilesheetInfo = cfg.map.tilesets?.[0];
+    const tilesheetImg = tilesheetInfo ? await loadSprite(tilesheetInfo.localImage) : null;
+    const TILE_COLS = tilesheetInfo?.columns || 1;
+
+    // Preload player sprites
+    await Promise.all([
+        loadSprite(cfg.entityTypes.player.human.sprite),
+        loadSprite(cfg.entityTypes.player.zombie.sprite),
+        loadSprite(cfg.entityTypes.player.sick.sprite)
+    ]);
+
+    // Load furniture sprites (background)
+    Object.values(cfg.entityTypes.furniture || {}).forEach(f => {
+        if (f.sprite) loadSprite(f.sprite);
+    });
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('ui').style.display = 'block';
+
+    // Game state constants (engine runs at 20 ticks per second by default)
+    const TICK_RATE = 20;  // 20 ticks per second
+    const TIME_PREOUTBREAK = 60 * TICK_RATE;  // 60 seconds
+    const TIME_SICK = 15 * TICK_RATE;         // 15 seconds
+    const OUTBREAK_RATIO = 0.3;               // 30% of players become sick
+
+    // Helper to get/set synchronized game state (stored in first player's sync)
+    function getGameState() {
+        const players = game.getEntitiesByType('player').sort((a, b) =>
+            (a.sync.clientId || '').localeCompare(b.sync.clientId || '')
+        );
+        if (players.length === 0) return null;
+
+        const firstPlayer = players[0];
+        // Initialize if not set
+        if (!firstPlayer.sync.gamePhase) {
+            firstPlayer.sync.gamePhase = 'waiting';
+            firstPlayer.sync.gamePhaseStartTick = 0;
+            firstPlayer.sync.gameSickInfectionTick = 0;
+            firstPlayer.sync.gameOutbreakTick = 0;
+            firstPlayer.sync.gameTick = 0;  // Synchronized tick counter
+        }
+        return firstPlayer.sync;
+    }
+
+    // Custom renderer for all entity types
+    renderer.drawEntity = (ctx, entity, pos, alpha) => {
+        // Disable image smoothing to prevent tile bleeding
+        ctx.imageSmoothingEnabled = false;
+
+        const type = entity.type;
+
+        // Floor tiles
+        if (type === '_floor') {
+            if (tilesheetImg && entity.sync.tileId) {
+                const tileId = entity.sync.tileId - 1; // Tiled uses 1-indexed
+                const srcX = (tileId % TILE_COLS) * TILE;
+                const srcY = Math.floor(tileId / TILE_COLS) * TILE;
+                ctx.drawImage(tilesheetImg, srcX, srcY, TILE, TILE, pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+            } else {
+                // Fallback
+                ctx.fillStyle = '#1a2332';
+                ctx.fillRect(pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+            }
+            return;
+        }
+
+        // Walls
+        if (type === 'wall') {
+            if (tilesheetImg && entity.sync.tileId) {
+                const tileId = entity.sync.tileId - 1; // Tiled uses 1-indexed
+                const srcX = (tileId % TILE_COLS) * TILE;
+                const srcY = Math.floor(tileId / TILE_COLS) * TILE;
+                ctx.drawImage(tilesheetImg, srcX, srcY, TILE, TILE, pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+            } else {
+                // Fallback
+                ctx.fillStyle = '#2c3e50';
+                ctx.fillRect(pos.x - TILE / 2, pos.y - TILE / 2, TILE, TILE);
+            }
+            return;
+        }
+
+        // Furniture
+        if (type === 'furniture') {
+            const sprite = sprites.get(entity.sync.sprite);
+            const w = entity.sync.w || TILE;
+            const h = entity.sync.h || TILE;
+            const angle = entity.sync.angle || 0;
+
+            ctx.save();
+            ctx.translate(pos.x, pos.y);
+            if (angle) ctx.rotate((angle * Math.PI) / 180);
+            if (sprite) {
+                ctx.drawImage(sprite, -w / 2, -h / 2, w, h);
+            } else {
+                ctx.fillStyle = '#7f8c8d';
+                ctx.fillRect(-w / 2, -h / 2, w, h);
+            }
+            ctx.restore();
+            return;
+        }
+
+        // Players
+        if (type === 'player') {
+            const team = entity.sync.team || 'human';
+            const teamConfig = cfg.entityTypes.player[team];
+            const sprite = sprites.get(teamConfig?.sprite);
+            const color = teamConfig?.color || '#fff';
+            const aimAngle = entity.sync.aimAngle || 0;
+
+            ctx.save();
+            ctx.translate(pos.x, pos.y);
+            ctx.rotate(aimAngle);
+
+            if (sprite) {
+                ctx.drawImage(sprite, -PLAYER_RADIUS, -PLAYER_RADIUS, PLAYER_RADIUS * 2, PLAYER_RADIUS * 2);
+            } else {
+                // Fallback: colored circle
+                ctx.beginPath();
+                ctx.arc(0, 0, PLAYER_RADIUS, 0, Math.PI * 2);
+                ctx.fillStyle = color;
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // Direction indicator
+                ctx.fillStyle = '#fff';
+                ctx.beginPath();
+                ctx.moveTo(PLAYER_RADIUS * 0.5, 0);
+                ctx.lineTo(PLAYER_RADIUS * 0.8, -PLAYER_RADIUS * 0.2);
+                ctx.lineTo(PLAYER_RADIUS * 0.8, PLAYER_RADIUS * 0.2);
+                ctx.fill();
+            }
+
+            ctx.restore();
+        }
+    };
+
+    // Entity classes for cleaner code and snapshot restore
+    class Floor extends Entity2D {
+        static { registerClass(this); }
+        constructor(x, y, tileId) {
+            super();
+            // Only initialize if called with parameters (not during snapshot restore)
+            if (x !== undefined) {
+                this.setType('_floor').setBody({
+                    type: 'static', shape: 'box', width: TILE, height: TILE, x, y, isSensor: true
+                });
+                this.sync.tileId = tileId;
+            }
+        }
+    }
+
+    class Wall extends Entity2D {
+        static { registerClass(this); }
+        constructor(x, y, tileId) {
+            super();
+            // Only initialize if called with parameters (not during snapshot restore)
+            if (x !== undefined) {
+                this.setType('wall').setBody({
+                    type: 'static', shape: 'box', width: TILE, height: TILE, x, y
+                });
+                this.sync.tileId = tileId;
+            }
+        }
+    }
+
+    class Furniture extends Entity2D {
+        static { registerClass(this); }
+        constructor(entity) {
+            super();
+            // Only initialize if called with entity config (not during snapshot restore)
+            if (entity) {
+                const type = cfg.entityTypes.furniture[entity.type];
+                const w = (entity.width || type.width) * TILE;
+                const h = (entity.height || type.height) * TILE;
+                const x = entity.x * TILE;
+                const y = entity.y * TILE;
+
+                this.setType('furniture').setBody({
+                    type: 'static', shape: 'box', width: w, height: h, x, y
+                });
+                this.sync.sprite = type.sprite;
+                this.sync.w = w;
+                this.sync.h = h;
+                this.sync.angle = entity.angle || 0;
+            }
+        }
+    }
+
+    class PlayerUnit extends Entity2D {
+        static { registerClass(this); }
+        constructor(clientId) {
+            super();
+            // Only initialize if called with clientId (not during snapshot restore)
+            if (clientId !== undefined) {
+                const spawn = cfg.regions.spawn;
+                const x = (spawn.x + dRandom() * spawn.width) * TILE;
+                const y = (spawn.y + dRandom() * spawn.height) * TILE;
+
+                this.setType('player').setBody({
+                    type: 'kinematic', shape: 'circle', radius: PLAYER_RADIUS, x, y
+                });
+                this.sync.clientId = clientId;
+                this.sync.team = 'human';
+                this.sync.score = 0;
+                this.sync.aimAngle = 0;
+            }
+        }
+    }
+
+    const callbacks = {
+        onRoomCreate() {
+            game.reset();
+
+            // Create floor tiles
+            const floorLayer = cfg.map.layers.find(l => l.name === 'floor' || l.name.includes('floor'));
+            if (floorLayer) {
+                for (let i = 0; i < floorLayer.data.length; i++) {
+                    if (floorLayer.data[i] !== 0) {
+                        const tx = (i % cfg.map.width) * TILE + TILE / 2;
+                        const ty = Math.floor(i / cfg.map.width) * TILE + TILE / 2;
+                        new Floor(tx, ty, floorLayer.data[i]);
+                    }
+                }
+            }
+
+            // Create walls
+            const wallLayer = cfg.map.layers.find(l => l.name === 'walls' || l.name === 'collision');
+            if (wallLayer) {
+                for (let i = 0; i < wallLayer.data.length; i++) {
+                    if (wallLayer.data[i] !== 0) {
+                        const tx = (i % cfg.map.width) * TILE + TILE / 2;
+                        const ty = Math.floor(i / cfg.map.width) * TILE + TILE / 2;
+                        new Wall(tx, ty, wallLayer.data[i]);
+                    }
+                }
+            }
+
+            // Create furniture
+            cfg.initialEntities.forEach(e => new Furniture(e));
+
+            phase = 'waiting';
+        },
+
+        onConnect(clientId) {
+            const player = new Player(clientId);
+            player.input.setCommands({
+                w: { keys: ['w', 'arrowup'] },
+                a: { keys: ['a', 'arrowleft'] },
+                s: { keys: ['s', 'arrowdown'] },
+                d: { keys: ['d', 'arrowright'] },
+                aim: { mouse: ['position'] }
+            });
+            player.unit = new PlayerUnit(clientId);
+        },
+
+        onDisconnect(clientId) {
+            const player = game.getPlayer(clientId);
+            if (player) {
+                player.unit?.destroy();
+                player.destroy();
+            }
+        },
+
+
+        onSnapshot(entities) {
+            // Restore player.unit links and input commands
+            for (const entity of entities) {
+                if (entity.sync?.hasInput) {
+                    entity.input.setCommands({
+                        w: { keys: ['w', 'arrowup'] },
+                        a: { keys: ['a', 'arrowleft'] },
+                        s: { keys: ['s', 'arrowdown'] },
+                        d: { keys: ['d', 'arrowright'] },
+                        aim: { mouse: ['position'] }
+                    });
+                    entity.unit = entities.find(e => e.type === 'player' && e.sync.clientId === entity.clientId);
+                }
+            }
+        },
+
+        onTick() {
+            // Get synchronized game state
+            const state = getGameState();
+            if (!state) return; // No players yet
+
+            // Increment synchronized tick counter
+            state.gameTick++;
+
+            // Get player entities (type='player') - these are the unit entities
+            const playerEntities = game.getEntitiesByType('player');
+
+            // Auto-start round when 2+ players join (deterministic - runs on all clients)
+            if (state.gamePhase === 'waiting' && playerEntities.length >= 2) {
+                startRound();
+            }
+
+            // Update all players (movement and aim)
+            // Get Player objects for each player entity
+            for (const unitEntity of playerEntities) {
+                const player = game.getPlayer(unitEntity.sync.clientId);
+                if (!player || !player.unit) continue;
+
+                const unit = player.unit;
+
+                // Movement - use separate command for each direction
+                const input = player.input;
+                if (input) {
+                    const dx = (input.d ? 1 : 0) - (input.a ? 1 : 0);
+                    const dy = (input.s ? 1 : 0) - (input.w ? 1 : 0);
+
+                    const mag = Math.sqrt(dx * dx + dy * dy);
+                    if (mag > 0) {
+                        // Speed formula: baseSpeed * (1 + score/30000) for all players
+                        const scoreMultiplier = 1 + (unit.sync.score || 0) / 30000;
+                        let speed;
+                        if (unit.sync.team === 'human') {
+                            speed = HUMAN_SPEED * scoreMultiplier;
+                        } else if (unit.sync.team === 'zombie') {
+                            speed = ZOMBIE_SPEED * scoreMultiplier;
+                        } else {
+                            // Sick: reduced speed
+                            speed = SICK_SPEED * scoreMultiplier;
+                        }
+                        unit.moveBy(dx / mag * speed, dy / mag * speed);
+                    }
+                }
+
+                // Mouse aim (transform from screen space to world space)
+                const aim = player.input?.aim;
+                if (aim?.x != null && aim?.y != null) {
+                    // Convert mouse screen position to world position
+                    const worldMouseX = aim.x + cameraX - canvas.width / 2;
+                    const worldMouseY = aim.y + cameraY - canvas.height / 2;
+                    const dx = worldMouseX - unit.x;
+                    const dy = worldMouseY - unit.y;
+                    unit.sync.aimAngle = Math.atan2(dy, dx) + Math.PI / 2;
+                }
+            }
+
+            // Phase transitions
+            const ticksInPhase = state.gameTick - state.gamePhaseStartTick;
+
+            if (state.gamePhase === 'preoutbreak') {
+                // Check if it's time to make players sick (45 seconds into preoutbreak)
+                if (state.gameSickInfectionTick === 0 && ticksInPhase >= (TIME_PREOUTBREAK - TIME_SICK)) {
+                    makeSomePlayersSick();
+                }
+
+                // Check if it's time for outbreak (60 seconds into preoutbreak)
+                if (ticksInPhase >= TIME_PREOUTBREAK) {
+                    startOutbreak();
+                }
+            }
+
+            if (state.gamePhase === 'postoutbreak') {
+                // Check win conditions
+                const playerEntities = game.getEntitiesByType('player');
+                const humans = playerEntities.filter(p => p.sync.team === 'human').length;
+                const zombies = playerEntities.filter(p => p.sync.team === 'zombie').length;
+
+                if (humans === 0 && zombies > 0) {
+                    endRound('zombies');
+                } else if (zombies === 0 && humans > 0) {
+                    endRound('humans');
+                }
+            }
+
+            // Infection logic (only during postoutbreak phase when zombies exist)
+            if (state.gamePhase === 'postoutbreak') {
+                const playerEntities = game.getEntitiesByType('player');
+                playerEntities.forEach(zombie => {
+                    if (zombie.sync.team !== 'zombie') return;
+                    playerEntities.forEach(human => {
+                        if (human.sync.team !== 'human') return;
+                        const dx = zombie.x - human.x, dy = zombie.y - human.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < INFECTION_DIST) {
+                            human.sync.team = 'zombie';  // Infected humans become zombies immediately
+                            zombie.sync.score = (zombie.sync.score || 0) + 1;
+                        }
+                    });
+                });
+            }
+
+            // Update camera (client-side only - doesn't affect determinism)
+            // Don't use game.getPlayers() - it returns ALL entities with input component
+            // Instead, get the local client's Player object directly
+            const localClientId = game.getClientId();
+            if (localClientId) {
+                const localPlayer = game.getPlayer(localClientId);
+                if (localPlayer && localPlayer.unit) {
+                    cameraX = localPlayer.unit.x;
+                    cameraY = localPlayer.unit.y;
+                }
+            }
+
+            updateUI();
+        }
+    };
+
+    function startRound() {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gamePhase = 'preoutbreak';
+        state.gamePhaseStartTick = state.gameTick;
+        state.gameSickInfectionTick = 0;
+        state.gameOutbreakTick = 0;
+
+        // Reset ALL players to human
+        const players = game.getEntitiesByType('player');
+        players.forEach((p) => {
+            p.sync.team = 'human';  // Everyone starts as human!
+            p.sync.score = 0;
+        });
+    }
+
+    function makeSomePlayersSick() {
+        const state = getGameState();
+        if (!state) return;
+
+        const players = game.getEntitiesByType('player');
+
+        // Sort for determinism
+        const humans = players.filter(p => p.sync.team === 'human')
+            .sort((a, b) => (a.sync.clientId || '').localeCompare(b.sync.clientId || ''));
+
+        const numToInfect = Math.max(1, Math.floor(humans.length * OUTBREAK_RATIO));
+
+        // Deterministic shuffle using tick number
+        const shuffled = [...humans];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = (state.gameTick + i) % (i + 1);
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+
+        for (let i = 0; i < numToInfect && i < shuffled.length; i++) {
+            shuffled[i].sync.team = 'sick';
+        }
+
+        state.gameSickInfectionTick = state.gameTick;
+    }
+
+    function startOutbreak() {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gamePhase = 'postoutbreak';
+        state.gameOutbreakTick = state.gameTick;
+
+        // Convert all sick players to zombies
+        const players = game.getEntitiesByType('player');
+        players.forEach(p => {
+            if (p.sync.team === 'sick') {
+                p.sync.team = 'zombie';
+            }
+        });
+    }
+
+    function endRound(winner) {
+        const state = getGameState();
+        if (!state) return;
+
+        state.gamePhase = 'ended';
+        setTimeout(() => {
+            // Check by player entity count, not game.getPlayers()
+            if (game.getEntitiesByType('player').length >= 2) startRound();
+            else {
+                const s = getGameState();
+                if (s) s.gamePhase = 'waiting';
+            }
+        }, 5000);
+    }
+
+    function updateUI() {
+        const state = getGameState();
+        if (!state) return;
+
+        const playerEntities = game.getEntitiesByType('player');
+        const humans = playerEntities.filter(p => p.sync.team === 'human').length;
+        const zombies = playerEntities.filter(p => p.sync.team === 'zombie').length;
+        const sick = playerEntities.filter(p => p.sync.team === 'sick').length;
+
+        const phaseEl = document.getElementById('phase');
+        const ticksInPhase = (state.gameTick || 0) - (state.gamePhaseStartTick || 0);
+
+        if (state.gamePhase === 'waiting') {
+            phaseEl.textContent = 'Waiting for players...';
+        } else if (state.gamePhase === 'preoutbreak') {
+            const secondsLeft = Math.max(0, Math.ceil((TIME_PREOUTBREAK - ticksInPhase) / TICK_RATE));
+            phaseEl.innerHTML = `Pre-outbreak: ${secondsLeft}s | <span class="team-humans">Humans: ${humans}</span> | Sick: ${sick}`;
+        } else if (state.gamePhase === 'postoutbreak') {
+            phaseEl.innerHTML = `<span class="team-humans">Humans: ${humans}</span> | <span class="team-zombies">Zombies: ${zombies}</span>`;
+        } else {
+            phaseEl.textContent = 'Round ended!';
+        }
+    }
+
+    game.connect('brains', callbacks);
+    Modu.enableDebugUI(game);
+})();
+</script>
+</body>
+</html>
