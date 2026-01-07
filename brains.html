@@ -80,10 +80,29 @@ async function initGame() {
     const renderer = game.addPlugin(Simple2DRenderer, canvas);
     window.game = game;
 
-    // Camera state - start at map center
-    let cameraX = MAP_W / 2, cameraY = MAP_H / 2;
-    let targetCameraX = cameraX, targetCameraY = cameraY;
-    const CAMERA_SMOOTHING = 0.15; // Adjust this value (0.05-0.3 typically works well)
+    // Camera state (simple object, not an entity - IIFE doesn't support Camera2D entity well)
+    const camera = {
+        x: MAP_W / 2,
+        y: MAP_H / 2,
+        zoom: 1.0,
+        smoothing: 0.15
+    };
+
+    // Catch-up synchronization flag (like snake game)
+    // When a late client joins, they receive a snapshot and simulate catch-up frames.
+    // During catch-up, we skip spawning to prevent entity ID divergence.
+    let isInCatchUp = false;
+
+    // Hash function for deterministic values (like cell-eater)
+    function hashString(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return hash >>> 0; // Ensure positive
+    }
 
     // ====================================================================
     // DEFINE CUSTOM COMPONENTS (NEW ECS API)
@@ -108,10 +127,26 @@ async function initGame() {
 
     const FurnitureData = defineComponent('FurnitureData', {
         spriteUrlId: 0,  // Interned string ID
-        w: { type: 'f32', default: 64 },
-        h: { type: 'f32', default: 64 },
-        angle: { type: 'f32', default: 0 }
+        w: 64,           // i32 - used in collision calculations
+        h: 64,           // i32 - used in collision calculations
+        angle: 0         // i32 - initial angle in degrees (render uses Transform2D.angle)
     });
+
+    // GameState component - replaces hacky sprite-based storage
+    // This ensures game state survives player disconnections
+    const GameStateComponent = defineComponent('GameState', {
+        phase: 0,              // 0=waiting, 1=preoutbreak, 2=postoutbreak, 3=ended
+        phaseStartTick: 0,
+        sickInfectionTick: 0,
+        outbreakTick: 0,
+        gameTick: 0
+    });
+
+    // Phase constants for GameState
+    const PHASE_WAITING = 0;
+    const PHASE_PREOUTBREAK = 1;
+    const PHASE_POSTOUTBREAK = 2;
+    const PHASE_ENDED = 3;
 
     // Game constants
     const HUMAN_SPEED = cfg.entityTypes.player.human.speed;
@@ -199,39 +234,61 @@ async function initGame() {
         .with(TeamComponent)
         .register();
 
+
+    // Game state entity - stores game phase info independent of players
+    game.defineEntity('_game-state')
+        .with(GameStateComponent)
+        .register();
+
     // Game state constants
     const TICK_RATE = 20;
     const TIME_PREOUTBREAK = 60 * TICK_RATE;
     const TIME_SICK = 15 * TICK_RATE;
     const OUTBREAK_RATIO = 0.3;
 
-    // Global game state (stored on first player to ensure synchronization)
-    let gameState = {
-        gamePhase: 'waiting',
-        gamePhaseStartTick: 0,
-        gameSickInfectionTick: 0,
-        gameOutbreakTick: 0,
-        gameTick: 0
-    };
+    // Game state entity reference (will be set after spawn)
+    let gameStateEntity = null;
 
+    // Get the game state entity (creates if needed for authority)
     function getGameState() {
-        const players = Array.from(game.query('player')).sort((a, b) =>
-            (a.get(Player).clientId || 0) - (b.get(Player).clientId || 0)
-        );
-        if (players.length === 0) return null;
-
-        const firstPlayer = players[0];
-        const sprite = firstPlayer.get(Sprite);
-
-        // Store state in sprite.color as interned value (hacky but works for sync)
-        if (!sprite.gamePhase) {
-            sprite.gamePhase = 'waiting';
-            sprite.gamePhaseStartTick = 0;
-            sprite.gameSickInfectionTick = 0;
-            sprite.gameOutbreakTick = 0;
-            sprite.gameTick = 0;
+        // Try to find existing game state entity
+        const stateEntities = Array.from(game.query('_game-state'));
+        if (stateEntities.length > 0) {
+            gameStateEntity = stateEntities[0];
+            return gameStateEntity.get(GameStateComponent);
         }
-        return sprite;
+        return null;
+    }
+
+    // Helper to get phase name for UI
+    function getPhaseName(phase) {
+        switch (phase) {
+            case PHASE_WAITING: return 'waiting';
+            case PHASE_PREOUTBREAK: return 'preoutbreak';
+            case PHASE_POSTOUTBREAK: return 'postoutbreak';
+            case PHASE_ENDED: return 'ended';
+            default: return 'unknown';
+        }
+    }
+
+    // ====================================================================
+    // CAMERA UPDATE FUNCTION
+    // ====================================================================
+    function updateCamera(alpha) {
+        const localClientId = game.localClientId;
+        if (!localClientId) return;
+
+        const localPlayer = game.getEntityByClientId(localClientId);
+        if (!localPlayer || localPlayer.destroyed) return;
+
+        // Use interpolated position for smoother camera movement
+        localPlayer.interpolate(alpha);
+        const targetX = localPlayer.render.interpX;
+        const targetY = localPlayer.render.interpY;
+
+        // Apply smoothing
+        camera.x += (targetX - camera.x) * camera.smoothing;
+        camera.y += (targetY - camera.y) * camera.smoothing;
     }
 
     // ====================================================================
@@ -242,31 +299,30 @@ async function initGame() {
         const ctx = renderer.context;
         const alpha = game.getRenderAlpha();
 
-        // Update camera position BEFORE rendering with smoothing
+        // Update camera
+        updateCamera(alpha);
+
+        // Get camera position for rendering
+        const camX = camera.x;
+        const camY = camera.y;
+        const zoom = camera.zoom;
+
+        // Find local player for interpolation tracking
         const localClientId = game.localClientId;
         let localPlayer = null;
         if (localClientId) {
-            // Use the built-in method to find the local player
             localPlayer = game.getEntityByClientId(localClientId);
-            if (localPlayer && !localPlayer.destroyed) {
-                // Use interpolated position for smoother camera movement
-                localPlayer.interpolate(alpha);
-                targetCameraX = localPlayer.render.interpX;
-                targetCameraY = localPlayer.render.interpY;
-
-                // Apply exponential smoothing to camera position
-                cameraX += (targetCameraX - cameraX) * CAMERA_SMOOTHING;
-                cameraY += (targetCameraY - cameraY) * CAMERA_SMOOTHING;
-            }
         }
 
         // Clear canvas
         ctx.fillStyle = '#0a0e14';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        // Apply camera transform
+        // Apply camera transform with zoom
         ctx.save();
-        ctx.translate(canvas.width / 2 - cameraX, canvas.height / 2 - cameraY);
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.scale(zoom, zoom);
+        ctx.translate(-camX, -camY);
         ctx.imageSmoothingEnabled = false;
 
         // Render all entities with custom drawing
@@ -281,6 +337,9 @@ async function initGame() {
 
         for (const entity of entities) {
             if (entity.destroyed) continue;
+
+            // Skip entities without Transform2D (like _game-state)
+            if (!entity.has(Transform2D)) continue;
 
             // Interpolate position (skip if already interpolated for camera)
             if (entity !== localPlayer) {
@@ -391,9 +450,28 @@ async function initGame() {
     // ====================================================================
     // INPUT SYSTEM (NEW ECS API)
     // ====================================================================
+    // Track mouse position for aim conversion
+    let mouseX = canvas.width / 2;
+    let mouseY = canvas.height / 2;
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        mouseX = e.clientX - rect.left;
+        mouseY = e.clientY - rect.top;
+    });
+
     const input = game.addPlugin(InputPlugin, canvas);
     input.action('move', { type: 'vector', bindings: ['keys:wasd', 'keys:arrows'] });
-    input.action('aim', { type: 'vector', bindings: ['mouse'] });
+    // Convert mouse to world coordinates BEFORE sending (so all clients get same world coords)
+    input.action('aim', {
+        type: 'vector',
+        bindings: [() => {
+            // Convert canvas coords to world coords using local camera
+            // This gets sent to all clients as world coordinates
+            const worldX = Math.round((mouseX - canvas.width / 2) / camera.zoom + camera.x);
+            const worldY = Math.round((mouseY - canvas.height / 2) / camera.zoom + camera.y);
+            return { x: worldX, y: worldY };
+        }]
+    });
 
     // ====================================================================
     // CAMERA SYSTEM - Now handled directly in renderer.render() above
@@ -456,7 +534,8 @@ async function initGame() {
                     x, y,
                     angle: angleRadians,  // Set Transform2D angle in radians
                     spriteUrlId,
-                    w, h,                // FurnitureData dimensions for rendering
+                    w: w | 0,            // FurnitureData dimensions (i32)
+                    h: h | 0,
                     width: w,            // Body2D width for physics
                     height: h,           // Body2D height for physics
                     mass: mass,          // Dynamic mass based on furniture type/size
@@ -474,22 +553,37 @@ async function initGame() {
                     console.log(`Created furniture: type=${e.type}, bodyType=${body.bodyType} (should be ${BODY_DYNAMIC} for dynamic), mass=${mass.toFixed(2)}`);
                 }
 
-                // Store rendering dimensions in FurnitureData
+                // Store rendering dimensions in FurnitureData (convert to integers for i32 fields)
                 const furnitureData = furniture.get(FurnitureData);
                 if (furnitureData) {
-                    furnitureData.angle = angleDegrees;
-                    furnitureData.w = w;
-                    furnitureData.h = h;
+                    furnitureData.angle = angleDegrees | 0;
+                    furnitureData.w = w | 0;
+                    furnitureData.h = h | 0;
                 }
             });
 
-            gameState.gamePhase = 'waiting';
+            // Spawn game state entity (authority creates it)
+            gameStateEntity = game.spawn('_game-state', {
+                phase: PHASE_WAITING,
+                phaseStartTick: 0,
+                sickInfectionTick: 0,
+                outbreakTick: 0,
+                gameTick: 0
+            });
         },
 
         onConnect(clientId) {
             const spawn = cfg.regions.spawn;
-            const x = (spawn.x + dRandom() * spawn.width) * TILE;
-            const y = (spawn.y + dRandom() * spawn.height) * TILE;
+            // Use hash-based spawn for determinism (like cell-eater)
+            const hash = hashString(clientId);
+            const spawnWidth = spawn.width * TILE;
+            const spawnHeight = spawn.height * TILE;
+            const spawnBaseX = spawn.x * TILE;
+            const spawnBaseY = spawn.y * TILE;
+
+            // Deterministic position from hash
+            const x = spawnBaseX + ((hash >>> 0) % spawnWidth);
+            const y = spawnBaseY + ((hash >>> 16 ^ hash) % spawnHeight);
 
             const player = game.spawn('player', {
                 x, y,
@@ -502,6 +596,27 @@ async function initGame() {
 
         onDisconnect(clientId) {
             game.getEntityByClientId(clientId)?.destroy();
+        },
+
+        // Catch-up synchronization for late joiners (like snake)
+        onSnapshot(entities) {
+            // Mark that we're in catch-up mode
+            isInCatchUp = true;
+            console.log(`[onSnapshot] Entering catch-up mode at frame ${game.frame}, ${entities.length} entities`);
+
+            // Find the game state entity from snapshot
+            for (const entity of entities) {
+                if (entity.type === '_game-state' && !entity.destroyed) {
+                    gameStateEntity = entity;
+                    break;
+                }
+            }
+
+            // Clear catch-up flag after synchronous catch-up completes
+            setTimeout(() => {
+                console.log(`[onSnapshot] Exiting catch-up mode at frame ${game.frame}`);
+                isInCatchUp = false;
+            }, 0);
         }
     };
 
@@ -551,13 +666,10 @@ async function initGame() {
                 player.setVelocity(0, 0);
             }
 
-            // Aiming with mouse (convert canvas coords to world coords)
+            // Aiming with mouse (aim input is already in world coordinates)
             if (inputData.aim) {
-                // Mouse comes in canvas coordinates, convert to world coordinates
-                const worldX = inputData.aim.x + cameraX - canvas.width / 2;
-                const worldY = inputData.aim.y + cameraY - canvas.height / 2;
-                const dx = worldX - transform.x;
-                const dy = worldY - transform.y;
+                const dx = inputData.aim.x - transform.x;
+                const dy = inputData.aim.y - transform.y;
                 teamComp.aimAngle = Math.atan2(dy, dx) + Math.PI / 2;
             }
         }
@@ -573,16 +685,16 @@ async function initGame() {
         const players = Array.from(game.query('player'));
 
         // Auto-start round when 2+ players join
-        if (state.gamePhase === 'waiting' && players.length >= 2) {
+        if (state.phase === PHASE_WAITING && players.length >= 2) {
             startRound();
         }
 
         // Phase transitions
-        const ticksInPhase = state.gameTick - state.gamePhaseStartTick;
+        const ticksInPhase = state.gameTick - state.phaseStartTick;
 
-        if (state.gamePhase === 'preoutbreak') {
+        if (state.phase === PHASE_PREOUTBREAK) {
             // Make players sick 45 seconds in
-            if (state.gameSickInfectionTick === 0 && ticksInPhase >= (TIME_PREOUTBREAK - TIME_SICK)) {
+            if (state.sickInfectionTick === 0 && ticksInPhase >= (TIME_PREOUTBREAK - TIME_SICK)) {
                 makeSomePlayersSick();
             }
 
@@ -592,7 +704,7 @@ async function initGame() {
             }
         }
 
-        if (state.gamePhase === 'postoutbreak') {
+        if (state.phase === PHASE_POSTOUTBREAK) {
             // Check win conditions
             const humans = players.filter(p => p.get(TeamComponent).team === TEAM_HUMAN).length;
             const zombies = players.filter(p => p.get(TeamComponent).team === TEAM_ZOMBIE).length;
@@ -607,35 +719,46 @@ async function initGame() {
         updateUI();
     }, { phase: 'update' });
 
-    // Infection system
+    // Furniture rotation system - apply angular velocity to Transform2D.angle
     game.addSystem(() => {
-        const state = getGameState();
-        if (!state || state.gamePhase !== 'postoutbreak') return;
+        for (const furniture of game.query('furniture')) {
+            const body = furniture.get(Body2D);
+            const transform = furniture.get(Transform2D);
 
-        const players = Array.from(game.query('player'));
+            if (!body || !transform) continue;
 
-        for (const zombie of players) {
-            const zombieTeam = zombie.get(TeamComponent);
-            if (zombieTeam.team !== TEAM_ZOMBIE) continue;
+            // Apply angular velocity to angle
+            if (body.angularVelocity && Math.abs(body.angularVelocity) > 0.0001) {
+                transform.angle += body.angularVelocity;
 
-            const zombieTransform = zombie.get(Transform2D);
+                // Apply angular damping (slow down rotation over time)
+                body.angularVelocity *= 0.95;
 
-            for (const human of players) {
-                const humanTeam = human.get(TeamComponent);
-                if (humanTeam.team !== TEAM_HUMAN) continue;
-
-                const humanTransform = human.get(Transform2D);
-                const dx = zombieTransform.x - humanTransform.x;
-                const dy = zombieTransform.y - humanTransform.y;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-
-                if (dist < INFECTION_DIST) {
-                    humanTeam.team = TEAM_ZOMBIE;
-                    zombieTeam.score++;
+                // Stop if very slow
+                if (Math.abs(body.angularVelocity) < 0.001) {
+                    body.angularVelocity = 0;
                 }
             }
         }
     }, { phase: 'update' });
+
+    // Infection via collision (player-player collision handler)
+    game.onCollision('player', 'player', (player1, player2) => {
+        const state = getGameState();
+        if (!state || state.phase !== PHASE_POSTOUTBREAK) return;
+
+        const team1 = player1.get(TeamComponent);
+        const team2 = player2.get(TeamComponent);
+
+        // Zombie infects human
+        if (team1.team === TEAM_ZOMBIE && team2.team === TEAM_HUMAN) {
+            team2.team = TEAM_ZOMBIE;
+            team1.score++;
+        } else if (team2.team === TEAM_ZOMBIE && team1.team === TEAM_HUMAN) {
+            team1.team = TEAM_ZOMBIE;
+            team2.score++;
+        }
+    });
 
     // ====================================================================
     // COLLISION HANDLERS
@@ -651,8 +774,8 @@ async function initGame() {
 
         if (!playerTransform || !furnitureTransform || !furnitureBody || !playerBody) return;
 
-        // Skip if player is not moving
-        const playerSpeed = Math.sqrt(playerBody.vx * playerBody.vx + playerBody.vy * playerBody.vy);
+        // Skip if player is not moving (use dSqrt for determinism)
+        const playerSpeed = dSqrt(playerBody.vx * playerBody.vx + playerBody.vy * playerBody.vy);
         if (playerSpeed < 10) return; // Minimum speed threshold
 
         // Get furniture dimensions for better collision point calculation
@@ -673,7 +796,7 @@ async function initGame() {
         // Calculate push direction (from player to furniture)
         const dx = furnitureTransform.x - playerTransform.x;
         const dy = furnitureTransform.y - playerTransform.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
+        const dist = dSqrt(dx * dx + dy * dy);
 
         if (dist > 0.01) { // Avoid division by zero
             // Push force based on player movement
@@ -718,10 +841,10 @@ async function initGame() {
         const state = getGameState();
         if (!state) return;
 
-        state.gamePhase = 'preoutbreak';
-        state.gamePhaseStartTick = state.gameTick;
-        state.gameSickInfectionTick = 0;
-        state.gameOutbreakTick = 0;
+        state.phase = PHASE_PREOUTBREAK;
+        state.phaseStartTick = state.gameTick;
+        state.sickInfectionTick = 0;
+        state.outbreakTick = 0;
 
         // Reset ALL players to human
         for (const player of game.query('player')) {
@@ -737,17 +860,17 @@ async function initGame() {
 
         const players = Array.from(game.query('player'));
 
-        // Sort for determinism
+        // Sort for determinism (must be consistent order across all clients)
         const humans = players
             .filter(p => p.get(TeamComponent).team === TEAM_HUMAN)
             .sort((a, b) => (a.get(Player).clientId || 0) - (b.get(Player).clientId || 0));
 
         const numToInfect = Math.max(1, Math.floor(humans.length * OUTBREAK_RATIO));
 
-        // Deterministic shuffle using tick number
+        // Fisher-Yates shuffle using dRandom() for determinism across all clients
         const shuffled = [...humans];
         for (let i = shuffled.length - 1; i > 0; i--) {
-            const j = (state.gameTick + i) % (i + 1);
+            const j = Math.floor(dRandom() * (i + 1));
             [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
         }
 
@@ -755,15 +878,15 @@ async function initGame() {
             shuffled[i].get(TeamComponent).team = TEAM_SICK;
         }
 
-        state.gameSickInfectionTick = state.gameTick;
+        state.sickInfectionTick = state.gameTick;
     }
 
     function startOutbreak() {
         const state = getGameState();
         if (!state) return;
 
-        state.gamePhase = 'postoutbreak';
-        state.gameOutbreakTick = state.gameTick;
+        state.phase = PHASE_POSTOUTBREAK;
+        state.outbreakTick = state.gameTick;
 
         // Convert all sick players to zombies
         for (const player of game.query('player')) {
@@ -778,13 +901,13 @@ async function initGame() {
         const state = getGameState();
         if (!state) return;
 
-        state.gamePhase = 'ended';
+        state.phase = PHASE_ENDED;
         setTimeout(() => {
             const players = Array.from(game.query('player'));
             if (players.length >= 2) startRound();
             else {
                 const s = getGameState();
-                if (s) s.gamePhase = 'waiting';
+                if (s) s.phase = PHASE_WAITING;
             }
         }, 5000);
     }
@@ -799,14 +922,14 @@ async function initGame() {
         const sick = players.filter(p => p.get(TeamComponent).team === TEAM_SICK).length;
 
         const phaseEl = document.getElementById('phase');
-        const ticksInPhase = (state.gameTick || 0) - (state.gamePhaseStartTick || 0);
+        const ticksInPhase = (state.gameTick || 0) - (state.phaseStartTick || 0);
 
-        if (state.gamePhase === 'waiting') {
+        if (state.phase === PHASE_WAITING) {
             phaseEl.textContent = 'Waiting for players...';
-        } else if (state.gamePhase === 'preoutbreak') {
+        } else if (state.phase === PHASE_PREOUTBREAK) {
             const secondsLeft = Math.max(0, Math.ceil((TIME_PREOUTBREAK - ticksInPhase) / TICK_RATE));
             phaseEl.innerHTML = `Pre-outbreak: ${secondsLeft}s | <span class="team-humans">Humans: ${humans}</span> | Sick: ${sick}`;
-        } else if (state.gamePhase === 'postoutbreak') {
+        } else if (state.phase === PHASE_POSTOUTBREAK) {
             phaseEl.innerHTML = `<span class="team-humans">Humans: ${humans}</span> | <span class="team-zombies">Zombies: ${zombies}</span>`;
         } else {
             phaseEl.textContent = 'Round ended!';
