@@ -129,7 +129,10 @@ async function initGame() {
         spriteUrlId: 0,  // Interned string ID
         w: 64,           // i32 - used in collision calculations
         h: 64,           // i32 - used in collision calculations
-        angle: 0         // i32 - initial angle in degrees (render uses Transform2D.angle)
+        angle: 0,        // i32 - initial angle in degrees (render uses Transform2D.angle)
+        initialX: { type: 'f32', default: 0 },  // Initial position for round reset
+        initialY: { type: 'f32', default: 0 },
+        initialAngle: { type: 'f32', default: 0 }
     });
 
     // GameState component - replaces hacky sprite-based storage
@@ -559,6 +562,11 @@ async function initGame() {
                     furnitureData.angle = angleDegrees | 0;
                     furnitureData.w = w | 0;
                     furnitureData.h = h | 0;
+                    // Store initial state for round reset (synced to all clients)
+                    furnitureData.initialX = x;
+                    furnitureData.initialY = y;
+                    furnitureData.initialAngle = angleRadians;
+                    console.log(`Stored initial furniture pos: (${x}, ${y}), angle: ${angleRadians}`);
                 }
             });
 
@@ -846,11 +854,77 @@ async function initGame() {
         state.sickInfectionTick = 0;
         state.outbreakTick = 0;
 
-        // Reset ALL players to human
+        // Reset ALL players to human and respawn in spawn region
+        const spawn = cfg.regions.spawn;
+        const spawnWidth = spawn.width * TILE;
+        const spawnHeight = spawn.height * TILE;
+        const spawnBaseX = spawn.x * TILE;
+        const spawnBaseY = spawn.y * TILE;
+
         for (const player of game.query('player')) {
             const teamComp = player.get(TeamComponent);
+            const playerComp = player.get(Player);
+            const transform = player.get(Transform2D);
+            const body = player.get(Body2D);
+
+            // Reset team and score
             teamComp.team = TEAM_HUMAN;
             teamComp.score = 0;
+
+            // Respawn in spawn region using deterministic hash
+            const hash = hashString(playerComp.clientId);
+            const x = spawnBaseX + ((hash >>> 0) % spawnWidth);
+            const y = spawnBaseY + ((hash >>> 16 ^ hash) % spawnHeight);
+
+            // Reset position
+            transform.x = x;
+            transform.y = y;
+
+            // Stop any movement
+            if (body) {
+                body.vx = 0;
+                body.vy = 0;
+            }
+        }
+
+        // Reset all furniture to initial positions and rotations
+        for (const furniture of game.query('furniture')) {
+            const furnitureData = furniture.get(FurnitureData);
+            const transform = furniture.get(Transform2D);
+            const bodyComp = furniture.get(Body2D);
+
+            if (furnitureData && transform) {
+                console.log(`Resetting furniture: current(${transform.x.toFixed(1)}, ${transform.y.toFixed(1)}) -> initial(${furnitureData.initialX.toFixed(1)}, ${furnitureData.initialY.toFixed(1)})`);
+
+                // For DYNAMIC bodies, we must set the physics body position directly
+                // (Transform2D is overwritten by physics in postPhysics phase)
+                const physicsBody = physics.getBody(furniture);
+                if (physicsBody) {
+                    // Set physics body position (uses fixed-point internally)
+                    physicsBody.position.x = toFixed(furnitureData.initialX);
+                    physicsBody.position.y = toFixed(furnitureData.initialY);
+                    physicsBody.angle = toFixed(furnitureData.initialAngle);
+                    // Stop movement
+                    physicsBody.linearVelocity.x = 0;
+                    physicsBody.linearVelocity.y = 0;
+                    physicsBody.angularVelocity = 0;
+                }
+
+                // Also set transform for immediate visual update
+                transform.x = furnitureData.initialX;
+                transform.y = furnitureData.initialY;
+                transform.angle = furnitureData.initialAngle;
+            }
+
+            // Reset Body2D component velocities too
+            if (bodyComp) {
+                bodyComp.vx = 0;
+                bodyComp.vy = 0;
+                bodyComp.angularVelocity = 0;
+                bodyComp.impulseX = 0;
+                bodyComp.impulseY = 0;
+                bodyComp.angularImpulse = 0;
+            }
         }
     }
 
