@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Brains - Zombie Tag</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0e14;
+            color: #e0e0e0;
+            font-family: system-ui, -apple-system, sans-serif;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        canvas { border: 2px solid #1a1f2e; background: #16213e; cursor: crosshair; }
+        #ui {
+            position: fixed; top: 20px; left: 20px;
+            background: rgba(0, 0, 0, 0.8); padding: 15px; border-radius: 8px;
+            backdrop-filter: blur(5px); min-width: 200px;
+        }
+        #ui h2 { color: #4ecdc4; font-size: 18px; margin-bottom: 10px; }
+        .phase { color: #ffd700; font-weight: bold; margin: 8px 0; }
+        .team-humans { color: #4ecdc4; }
+        .team-zombies { color: #e94560; }
+        #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #4ecdc4; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading game...</div>
+    <canvas id="game"></canvas>
+    <div id="ui" style="display: none;">
+        <h2>Brains</h2>
+        <div class="phase" id="phase">Waiting...</div>
+        <div id="score"></div>
+    </div>
+
+    <!-- Engine from CDN/localhost -->
+    <script src="http://localhost:3001/dist/modu.min.js"></script>
+    <!-- Built game bundle -->
+    <script src="dist/game.js"></script>
+</body>
+</html>
