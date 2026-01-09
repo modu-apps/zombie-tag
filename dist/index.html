@@ -41,6 +41,8 @@
     <script>
         document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\/script>');
     </script>
+    <!-- Expose Modu global for bundled imports -->
+    <script>if(typeof Modu!=='undefined')window.Modu=Modu;</script>
     <!-- Game bundle (uses Modu global) -->
     <script src="game.js"></script>
 </body>
