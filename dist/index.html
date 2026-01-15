@@ -37,10 +37,8 @@
         <div id="score"></div>
     </div>
 
-    <!-- Modu Engine (CDN with cache busting) -->
-    <script>
-        document.write('<script src="https://cdn.moduengine.com/modu.iife.js?v=' + Date.now() + '"><\/script>');
-    </script>
+    <!-- Modu Engine -->
+    <script src="http://localhost:3001/dist/modu.iife.js"></script>
     <!-- Expose Modu global for bundled imports -->
     <script>if(typeof Modu!=='undefined')window.Modu=Modu;</script>
     <!-- Game bundle (uses Modu global) -->

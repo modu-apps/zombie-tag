@@ -27,7 +27,7 @@ import {
 } from './constants';
 
 import { TeamComponent, TileData, FurnitureData, GamePhaseComponent } from './entities';
-import { getGameStateEntity, getSortedPlayers } from './systems';
+import { getGameStateEntity, getSortedPlayers, aimAngleCache } from './systems';
 import type { GameConfig, SpriteCache } from './types';
 
 // ============================================
@@ -96,15 +96,49 @@ export function createRenderer(
         ctx.translate(canvas.width / 2 - camX, canvas.height / 2 - camY);
         ctx.imageSmoothingEnabled = false;
 
-        // Get all entities and sort by layer
-        const entities = Array.from(game.getAllEntities()).filter(e => !e.destroyed);
+        // Render floor tiles directly from tilemap (NOT as entities - saves ~1500 entities)
+        const floorLayer = config.map.layers.find(l => l.name === 'floor' || l.name.includes('floor'));
+        if (floorLayer && spriteCache.tilesheetImg) {
+            for (let i = 0; i < floorLayer.data.length; i++) {
+                const tileId = floorLayer.data[i];
+                if (tileId !== 0) {
+                    const tx = (i % config.map.width) * tileSize;
+                    const ty = Math.floor(i / config.map.width) * tileSize;
+                    const srcTileId = tileId - 1;
+                    const srcX = (srcTileId % tileCols) * tileSize;
+                    const srcY = Math.floor(srcTileId / tileCols) * tileSize;
+                    ctx.drawImage(spriteCache.tilesheetImg, srcX, srcY, tileSize, tileSize, tx, ty, tileSize, tileSize);
+                }
+            }
+        }
+
+        // Render wall tiles directly from tilemap (NOT as entities)
+        const wallLayer = config.map.layers.find(l => l.name === 'walls' || l.name === 'collision');
+        if (wallLayer && spriteCache.tilesheetImg) {
+            for (let i = 0; i < wallLayer.data.length; i++) {
+                const tileId = wallLayer.data[i];
+                if (tileId !== 0) {
+                    const tx = (i % config.map.width) * tileSize;
+                    const ty = Math.floor(i / config.map.width) * tileSize;
+                    const srcTileId = tileId - 1;
+                    const srcX = (srcTileId % tileCols) * tileSize;
+                    const srcY = Math.floor(srcTileId / tileCols) * tileSize;
+                    ctx.drawImage(spriteCache.tilesheetImg, srcX, srcY, tileSize, tileSize, tx, ty, tileSize, tileSize);
+                }
+            }
+        }
+
+        // Get dynamic entities (furniture, players) and sort by layer
+        const entities = Array.from(game.getAllEntities()).filter(e =>
+            !e.destroyed && (e.type === 'furniture' || e.type === 'player')
+        );
         entities.sort((a, b) => {
             const aLayer = a.has(Sprite) ? a.get(Sprite).layer : 0;
             const bLayer = b.has(Sprite) ? b.get(Sprite).layer : 0;
             return aLayer - bLayer;
         });
 
-        // Render all entities
+        // Render dynamic entities only
         for (const entity of entities) {
             if (entity.destroyed) continue;
 
@@ -112,18 +146,6 @@ export function createRenderer(
             entity.interpolate(alpha);
             const pos = { x: entity.render.interpX, y: entity.render.interpY };
             const type = entity.type;
-
-            // Floor tiles
-            if (type === '_floor' && entity.has(TileData)) {
-                renderTile(ctx, entity, pos, tileSize, spriteCache, tileCols, '#1a2332');
-                continue;
-            }
-
-            // Walls
-            if (type === 'wall' && entity.has(TileData)) {
-                renderTile(ctx, entity, pos, tileSize, spriteCache, tileCols, '#2c3e50');
-                continue;
-            }
 
             // Furniture
             if (type === 'furniture' && entity.has(FurnitureData)) {
@@ -220,7 +242,8 @@ function renderPlayer(
     const teamConfig = config.entityTypes.player[teamName];
     const sprite = spriteCache.sprites.get(teamConfig?.sprite || '');
     const color = teamConfig?.color || '#fff';
-    const aimAngle = teamComp.aimAngle;
+    // Get aim angle from local cache (not synced to avoid floating-point desync)
+    const aimAngle = aimAngleCache.get(entity.eid) || 0;
 
     ctx.save();
     ctx.translate(pos.x, pos.y);

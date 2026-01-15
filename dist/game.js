@@ -63,8 +63,8 @@ var BrainsGame = (() => {
   var TeamComponent = (0, import_modu_engine.defineComponent)("Team", {
     team: TEAM_HUMAN,
     // 0=human, 1=zombie, 2=sick
-    score: 0,
-    aimAngle: { type: "f32", default: 0 }
+    score: 0
+    // Note: aimAngle removed from sync - computed at render time to avoid floating-point desync
   });
   var GamePhaseComponent = (0, import_modu_engine.defineComponent)("GamePhase", {
     phase: PHASE_WAITING,
@@ -80,15 +80,16 @@ var BrainsGame = (() => {
   var FurnitureData = (0, import_modu_engine.defineComponent)("FurnitureData", {
     spriteUrlId: 0,
     // Interned string ID
-    w: { type: "f32", default: 64 },
-    h: { type: "f32", default: 64 },
+    w: 64,
+    // Pixel width (integer to avoid f32 desync)
+    h: 64,
+    // Pixel height (integer to avoid f32 desync)
     configIndex: 0
     // Index in config.initialEntities for position reset
   });
   function defineEntities(game2, tileSize2, playerRadius2) {
     game2.defineEntity("game-state").with(GamePhaseComponent).register();
-    game2.defineEntity("_floor").with(import_modu_engine.Transform2D).with(import_modu_engine.Sprite, { shape: import_modu_engine.SHAPE_RECT, width: tileSize2, height: tileSize2, layer: 0, visible: false }).with(import_modu_engine.Body2D, { shapeType: import_modu_engine.SHAPE_RECT, width: tileSize2, height: tileSize2, bodyType: import_modu_engine.BODY_STATIC, isSensor: true }).with(TileData).register();
-    game2.defineEntity("wall").with(import_modu_engine.Transform2D).with(import_modu_engine.Sprite, { shape: import_modu_engine.SHAPE_RECT, width: tileSize2, height: tileSize2, layer: 1, visible: false }).with(import_modu_engine.Body2D, { shapeType: import_modu_engine.SHAPE_RECT, width: tileSize2, height: tileSize2, bodyType: import_modu_engine.BODY_STATIC }).with(TileData).register();
+    game2.defineEntity("wall").with(import_modu_engine.Transform2D).with(import_modu_engine.Body2D, { shapeType: import_modu_engine.SHAPE_RECT, width: tileSize2, height: tileSize2, bodyType: import_modu_engine.BODY_STATIC }).register();
     game2.defineEntity("furniture").with(import_modu_engine.Transform2D).with(import_modu_engine.Sprite, { shape: import_modu_engine.SHAPE_RECT, layer: 2, visible: false }).with(import_modu_engine.Body2D, {
       shapeType: import_modu_engine.SHAPE_RECT,
       bodyType: import_modu_engine.BODY_DYNAMIC,
@@ -100,7 +101,7 @@ var BrainsGame = (() => {
       height: tileSize2
     }).with(FurnitureData).register();
     game2.defineEntity("player").with(import_modu_engine.Transform2D).with(import_modu_engine.Sprite, { shape: import_modu_engine.SHAPE_CIRCLE, radius: playerRadius2, layer: 3 }).with(import_modu_engine.Body2D, { shapeType: import_modu_engine.SHAPE_CIRCLE, radius: playerRadius2, bodyType: import_modu_engine.BODY_KINEMATIC }).with(import_modu_engine.Player).with(TeamComponent).register();
-    game2.defineEntity("camera").with(import_modu_engine.Camera2D, { smoothing: 0.15 }).syncNone().register();
+    game2.defineEntity("camera").with(import_modu_engine.Camera2D, { smoothing: 0.5 }).syncNone().register();
   }
 
   // src/systems.ts
@@ -166,6 +167,7 @@ var BrainsGame = (() => {
       }
     };
   }
+  var aimAngleCache = /* @__PURE__ */ new Map();
   function createAimingSystem(game2, canvasWidth, canvasHeight) {
     const centerX = canvasWidth / 2;
     const centerY = canvasHeight / 2;
@@ -173,7 +175,6 @@ var BrainsGame = (() => {
       const sortedPlayers = getSortedPlayers(game2);
       for (const player of sortedPlayers) {
         const playerComp = player.get(import_modu_engine2.Player);
-        const teamComp = player.get(TeamComponent);
         const inputData = game2.world.getInput(playerComp.clientId);
         if (!inputData?.aim)
           continue;
@@ -189,7 +190,7 @@ var BrainsGame = (() => {
         }
         const dx = mouseX - centerX;
         const dy = mouseY - centerY;
-        teamComp.aimAngle = Math.atan2(dy, dx) + Math.PI / 2;
+        aimAngleCache.set(player.eid, Math.atan2(dy, dx) + Math.PI / 2);
       }
     };
   }
@@ -329,16 +330,6 @@ var BrainsGame = (() => {
         const pushY = dy / dist * pushStrength;
         furnitureBody.impulseX += pushX;
         furnitureBody.impulseY += pushY;
-        const torque = (collisionX * pushY - collisionY * pushX) * 1e-5;
-        const massEffect = 3 / (furnitureBody.mass || 5);
-        const adjustedTorque = torque * massEffect;
-        const maxAngularVelocity = 0.5;
-        const currentAngVel = furnitureBody.angularVelocity || 0;
-        const newAngularVelocity = currentAngVel + adjustedTorque;
-        furnitureBody.angularVelocity = Math.max(
-          -maxAngularVelocity,
-          Math.min(maxAngularVelocity, newAngularVelocity)
-        );
       }
     });
   }
@@ -381,7 +372,37 @@ var BrainsGame = (() => {
       ctx.save();
       ctx.translate(canvas2.width / 2 - camX, canvas2.height / 2 - camY);
       ctx.imageSmoothingEnabled = false;
-      const entities = Array.from(game2.getAllEntities()).filter((e) => !e.destroyed);
+      const floorLayer = config2.map.layers.find((l) => l.name === "floor" || l.name.includes("floor"));
+      if (floorLayer && spriteCache2.tilesheetImg) {
+        for (let i = 0; i < floorLayer.data.length; i++) {
+          const tileId = floorLayer.data[i];
+          if (tileId !== 0) {
+            const tx = i % config2.map.width * tileSize2;
+            const ty = Math.floor(i / config2.map.width) * tileSize2;
+            const srcTileId = tileId - 1;
+            const srcX = srcTileId % tileCols * tileSize2;
+            const srcY = Math.floor(srcTileId / tileCols) * tileSize2;
+            ctx.drawImage(spriteCache2.tilesheetImg, srcX, srcY, tileSize2, tileSize2, tx, ty, tileSize2, tileSize2);
+          }
+        }
+      }
+      const wallLayer = config2.map.layers.find((l) => l.name === "walls" || l.name === "collision");
+      if (wallLayer && spriteCache2.tilesheetImg) {
+        for (let i = 0; i < wallLayer.data.length; i++) {
+          const tileId = wallLayer.data[i];
+          if (tileId !== 0) {
+            const tx = i % config2.map.width * tileSize2;
+            const ty = Math.floor(i / config2.map.width) * tileSize2;
+            const srcTileId = tileId - 1;
+            const srcX = srcTileId % tileCols * tileSize2;
+            const srcY = Math.floor(srcTileId / tileCols) * tileSize2;
+            ctx.drawImage(spriteCache2.tilesheetImg, srcX, srcY, tileSize2, tileSize2, tx, ty, tileSize2, tileSize2);
+          }
+        }
+      }
+      const entities = Array.from(game2.getAllEntities()).filter(
+        (e) => !e.destroyed && (e.type === "furniture" || e.type === "player")
+      );
       entities.sort((a, b) => {
         const aLayer = a.has(import_modu_engine3.Sprite) ? a.get(import_modu_engine3.Sprite).layer : 0;
         const bLayer = b.has(import_modu_engine3.Sprite) ? b.get(import_modu_engine3.Sprite).layer : 0;
@@ -393,14 +414,6 @@ var BrainsGame = (() => {
         entity.interpolate(alpha);
         const pos = { x: entity.render.interpX, y: entity.render.interpY };
         const type = entity.type;
-        if (type === "_floor" && entity.has(TileData)) {
-          renderTile(ctx, entity, pos, tileSize2, spriteCache2, tileCols, "#1a2332");
-          continue;
-        }
-        if (type === "wall" && entity.has(TileData)) {
-          renderTile(ctx, entity, pos, tileSize2, spriteCache2, tileCols, "#2c3e50");
-          continue;
-        }
         if (type === "furniture" && entity.has(FurnitureData)) {
           renderFurniture(ctx, game2, entity, pos, spriteCache2);
           continue;
@@ -412,29 +425,6 @@ var BrainsGame = (() => {
       ctx.restore();
     }
     return renderWithCamera;
-  }
-  function renderTile(ctx, entity, pos, tileSize2, spriteCache2, tileCols, fallbackColor) {
-    const tileData = entity.get(TileData);
-    const tilesheetImg = spriteCache2.tilesheetImg;
-    if (tilesheetImg && tileData.tileId) {
-      const tileId = tileData.tileId - 1;
-      const srcX = tileId % tileCols * tileSize2;
-      const srcY = Math.floor(tileId / tileCols) * tileSize2;
-      ctx.drawImage(
-        tilesheetImg,
-        srcX,
-        srcY,
-        tileSize2,
-        tileSize2,
-        pos.x - tileSize2 / 2,
-        pos.y - tileSize2 / 2,
-        tileSize2,
-        tileSize2
-      );
-    } else {
-      ctx.fillStyle = fallbackColor;
-      ctx.fillRect(pos.x - tileSize2 / 2, pos.y - tileSize2 / 2, tileSize2, tileSize2);
-    }
   }
   function renderFurniture(ctx, game2, entity, pos, spriteCache2) {
     const furnitureData = entity.get(FurnitureData);
@@ -463,7 +453,7 @@ var BrainsGame = (() => {
     const teamConfig = config2.entityTypes.player[teamName];
     const sprite = spriteCache2.sprites.get(teamConfig?.sprite || "");
     const color = teamConfig?.color || "#fff";
-    const aimAngle = teamComp.aimAngle;
+    const aimAngle = aimAngleCache.get(entity.eid) || 0;
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(aimAngle);
@@ -591,29 +581,14 @@ var BrainsGame = (() => {
       const cam = cameraEntity.get(import_modu_engine4.Camera2D);
       cam.x = mapWidth / 2;
       cam.y = mapHeight / 2;
-      cam.smoothing = 0.15;
+      cam.smoothing = 0.5;
       renderer.camera = cameraEntity;
     }
     return cameraEntity;
   }
-  function createMap() {
-    const stateEntity = game.spawn("game-state", {
-      phase: PHASE_WAITING,
-      gameTick: 0,
-      phaseStartTick: 0,
-      sickInfectionTick: 0,
-      outbreakTick: 0
-    });
-    const floorLayer = config.map.layers.find((l) => l.name === "floor" || l.name.includes("floor"));
-    if (floorLayer) {
-      for (let i = 0; i < floorLayer.data.length; i++) {
-        if (floorLayer.data[i] !== 0) {
-          const tx = i % config.map.width * tileSize + tileSize / 2;
-          const ty = Math.floor(i / config.map.width) * tileSize + tileSize / 2;
-          game.spawn("_floor", { x: tx, y: ty, tileId: floorLayer.data[i] });
-        }
-      }
-    }
+  function createStaticMap() {
+    if ([...game.query("wall")].length > 0)
+      return;
     const wallLayer = config.map.layers.find((l) => l.name === "walls" || l.name === "collision");
     if (wallLayer) {
       for (let i = 0; i < wallLayer.data.length; i++) {
@@ -624,6 +599,16 @@ var BrainsGame = (() => {
         }
       }
     }
+  }
+  function createMap() {
+    createStaticMap();
+    const stateEntity = game.spawn("game-state", {
+      phase: PHASE_WAITING,
+      gameTick: 0,
+      phaseStartTick: 0,
+      sickInfectionTick: 0,
+      outbreakTick: 0
+    });
     config.initialEntities.forEach((e, configIndex) => {
       const type = config.entityTypes.furniture[e.type];
       if (!type)
@@ -668,16 +653,22 @@ var BrainsGame = (() => {
     });
   }
   function spawnPlayer(clientId) {
+    const numericId = game.internClientId(clientId);
+    const existing = game.world.getEntityByClientId(numericId);
+    if (existing) {
+      console.log(`[spawn] Player ${clientId.slice(0, 8)} already exists (eid=${existing.eid}), skipping spawn`);
+      return;
+    }
     const spawn = config.regions.spawn;
-    const x = (spawn.x + (0, import_modu_engine4.dRandom)() * spawn.width) * tileSize;
-    const y = (spawn.y + (0, import_modu_engine4.dRandom)() * spawn.height) * tileSize;
+    const x = (spawn.x + spawn.width / 2) * tileSize;
+    const y = (spawn.y + spawn.height / 2) * tileSize;
+    console.log(`[spawn] Creating player ${clientId.slice(0, 8)} at (${x.toFixed(0)}, ${y.toFixed(0)})`);
     game.spawn("player", {
       x,
       y,
       clientId,
       team: TEAM_HUMAN,
-      score: 0,
-      aimAngle: 0
+      score: 0
     });
   }
   function despawnPlayer(clientId) {
@@ -769,7 +760,8 @@ var BrainsGame = (() => {
        * When a client joins late, they receive a snapshot of the current game state.
        * This callback allows us to properly synchronize client state with the server.
        *
-       * Without this, late joiners would have divergent state and desync issues.
+       * Note: Walls are now synced (not syncNone) to ensure physics body creation
+       * order matches room creator. This prevents physics divergence.
        */
       onSnapshot(entities) {
         const localId = getLocalClientId();

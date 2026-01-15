@@ -136,7 +136,12 @@ async function build() {
         }
     }
 
-    // Create/update index.html in dist (matching snake's pattern)
+    // Create/update index.html in dist
+    // Use local engine in development, CDN in CI
+    const engineScript = isCI
+        ? `<script>document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\\/script>');</script>`
+        : `<script src="http://localhost:3001/dist/modu.iife.js"></script>`;
+
     const indexHtml = `<!DOCTYPE html>
 <html>
 <head>
@@ -176,10 +181,8 @@ async function build() {
         <div id="score"></div>
     </div>
 
-    <!-- Modu Engine (CDN with cache busting) -->
-    <script>
-        document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\\/script>');
-    </script>
+    <!-- Modu Engine -->
+    ${engineScript}
     <!-- Expose Modu global for bundled imports -->
     <script>if(typeof Modu!=='undefined')window.Modu=Modu;</script>
     <!-- Game bundle (uses Modu global) -->

@@ -34,8 +34,8 @@ import {
  */
 export const TeamComponent = defineComponent('Team', {
     team: TEAM_HUMAN,       // 0=human, 1=zombie, 2=sick
-    score: 0,
-    aimAngle: { type: 'f32', default: 0 }
+    score: 0
+    // Note: aimAngle removed from sync - computed at render time to avoid floating-point desync
 });
 
 /**
@@ -64,8 +64,8 @@ export const TileData = defineComponent('TileData', {
  */
 export const FurnitureData = defineComponent('FurnitureData', {
     spriteUrlId: 0,  // Interned string ID
-    w: { type: 'f32', default: 64 },
-    h: { type: 'f32', default: 64 },
+    w: 64,           // Pixel width (integer to avoid f32 desync)
+    h: 64,           // Pixel height (integer to avoid f32 desync)
     configIndex: 0   // Index in config.initialEntities for position reset
 });
 
@@ -80,20 +80,17 @@ export function defineEntities(game: Game, tileSize: number, playerRadius: numbe
         .with(GamePhaseComponent)
         .register();
 
-    // Floor tiles - visual only, sensor body
-    game.defineEntity('_floor')
-        .with(Transform2D)
-        .with(Sprite, { shape: SHAPE_RECT, width: tileSize, height: tileSize, layer: 0, visible: false })
-        .with(Body2D, { shapeType: SHAPE_RECT, width: tileSize, height: tileSize, bodyType: BODY_STATIC, isSensor: true })
-        .with(TileData)
-        .register();
+    // Floor tiles - NO LONGER ENTITIES
+    // Floors are rendered directly from tilemap data in render.ts
+    // This saves ~1500+ entities and massive snapshot size
 
-    // Walls - solid collision
+    // Walls - physics collision only (rendered from tilemap in render.ts)
+    // MUST be synced to ensure physics body creation order matches between
+    // room creator and late joiners. Without sync, walls are created at different
+    // times causing physics divergence.
     game.defineEntity('wall')
         .with(Transform2D)
-        .with(Sprite, { shape: SHAPE_RECT, width: tileSize, height: tileSize, layer: 1, visible: false })
         .with(Body2D, { shapeType: SHAPE_RECT, width: tileSize, height: tileSize, bodyType: BODY_STATIC })
-        .with(TileData)
         .register();
 
     // Furniture - dynamic physics objects (pushable)
@@ -124,7 +121,7 @@ export function defineEntities(game: Game, tileSize: number, playerRadius: numbe
 
     // Camera entity - client-only, excluded from snapshots
     game.defineEntity('camera')
-        .with(Camera2D, { smoothing: 0.15 })
+        .with(Camera2D, { smoothing: 0.5 })
         .syncNone()
         .register();
 }

@@ -95,7 +95,7 @@ function ensureCameraEntity(): Entity {
         const cam = cameraEntity.get(Camera2D);
         cam.x = mapWidth / 2;
         cam.y = mapHeight / 2;
-        cam.smoothing = 0.15;
+        cam.smoothing = 0.5;  // Higher = more responsive (0.15 was too laggy)
         renderer.camera = cameraEntity;
     }
     return cameraEntity;
@@ -105,29 +105,17 @@ function ensureCameraEntity(): Entity {
 // Room Creation - Map Setup
 // ============================================
 
-function createMap(): void {
-    // Create game-state entity to hold authoritative game phase
-    const stateEntity = game.spawn('game-state', {
-        phase: PHASE_WAITING,
-        gameTick: 0,
-        phaseStartTick: 0,
-        sickInfectionTick: 0,
-        outbreakTick: 0
-    });
+/**
+ * Create static map elements (floors, walls) - called by everyone including late joiners.
+ * These are .syncNone() so they're not in snapshots - each client creates them locally.
+ */
+function createStaticMap(): void {
+    // Skip if already created (check for any wall)
+    if ([...game.query('wall')].length > 0) return;
 
-    // Create floor tiles
-    const floorLayer = config.map.layers.find(l => l.name === 'floor' || l.name.includes('floor'));
-    if (floorLayer) {
-        for (let i = 0; i < floorLayer.data.length; i++) {
-            if (floorLayer.data[i] !== 0) {
-                const tx = (i % config.map.width) * tileSize + tileSize / 2;
-                const ty = Math.floor(i / config.map.width) * tileSize + tileSize / 2;
-                game.spawn('_floor', { x: tx, y: ty, tileId: floorLayer.data[i] });
-            }
-        }
-    }
+    // Floor tiles are NO LONGER entities - rendered directly from tilemap in render.ts
 
-    // Create walls
+    // Create walls (needed for physics collision)
     const wallLayer = config.map.layers.find(l => l.name === 'walls' || l.name === 'collision');
     if (wallLayer) {
         for (let i = 0; i < wallLayer.data.length; i++) {
@@ -138,6 +126,20 @@ function createMap(): void {
             }
         }
     }
+}
+
+function createMap(): void {
+    // Create static map (floors, walls)
+    createStaticMap();
+
+    // Create game-state entity to hold authoritative game phase
+    const stateEntity = game.spawn('game-state', {
+        phase: PHASE_WAITING,
+        gameTick: 0,
+        phaseStartTick: 0,
+        sickInfectionTick: 0,
+        outbreakTick: 0
+    });
 
     // Create furniture
     config.initialEntities.forEach((e, configIndex) => {
@@ -197,16 +199,29 @@ function createMap(): void {
 // ============================================
 
 function spawnPlayer(clientId: string): void {
-    const spawn = config.regions.spawn;
-    const x = (spawn.x + Math.random() * spawn.width) * tileSize;
-    const y = (spawn.y + Math.random() * spawn.height) * tileSize;
+    // CRITICAL: Check if player entity already exists (from snapshot)
+    // This prevents duplicate entity creation that causes desync
+    // Must intern first to ensure mapping exists, then use world method with numeric ID
+    // (Same pattern as push-box game which doesn't have desync issues)
+    const numericId = game.internClientId(clientId);
+    const existing = game.world.getEntityByClientId(numericId);
+    if (existing) {
+        console.log(`[spawn] Player ${clientId.slice(0,8)} already exists (eid=${existing.eid}), skipping spawn`);
+        return;
+    }
 
+    const spawn = config.regions.spawn;
+    // Fixed spawn position - center of spawn region
+    // Using Math.random() causes desync because late joiners have different RNG state during catchup
+    const x = (spawn.x + spawn.width / 2) * tileSize;
+    const y = (spawn.y + spawn.height / 2) * tileSize;
+
+    console.log(`[spawn] Creating player ${clientId.slice(0,8)} at (${x.toFixed(0)}, ${y.toFixed(0)})`);
     game.spawn('player', {
         x, y,
         clientId,
         team: TEAM_HUMAN,
-        score: 0,
-        aimAngle: 0
+        score: 0
     });
 }
 
@@ -337,7 +352,8 @@ export async function initGame(): Promise<void> {
          * When a client joins late, they receive a snapshot of the current game state.
          * This callback allows us to properly synchronize client state with the server.
          *
-         * Without this, late joiners would have divergent state and desync issues.
+         * Note: Walls are now synced (not syncNone) to ensure physics body creation
+         * order matches room creator. This prevents physics divergence.
          */
         onSnapshot(entities: Entity[]) {
             // Find local player and center camera on them

@@ -143,6 +143,10 @@ export function createMovementSystem(
 // Aiming System
 // ============================================
 
+// Local aim angle cache - NOT synced to avoid floating-point desync
+// Key: entity ID, Value: aim angle in radians
+export const aimAngleCache = new Map<number, number>();
+
 export function createAimingSystem(game: Game, canvasWidth: number, canvasHeight: number): () => void {
     const centerX = canvasWidth / 2;
     const centerY = canvasHeight / 2;
@@ -152,7 +156,6 @@ export function createAimingSystem(game: Game, canvasWidth: number, canvasHeight
 
         for (const player of sortedPlayers) {
             const playerComp = player.get(Player);
-            const teamComp = player.get(TeamComponent);
             const inputData = game.world.getInput(playerComp.clientId);
 
             if (!inputData?.aim) continue;
@@ -174,8 +177,8 @@ export function createAimingSystem(game: Game, canvasWidth: number, canvasHeight
             const dx = mouseX - centerX;
             const dy = mouseY - centerY;
 
-            // Convert to angle (add PI/2 so "up" in screen space points forward)
-            teamComp.aimAngle = Math.atan2(dy, dx) + Math.PI / 2;
+            // Store in local cache (not synced) - Math.atan2 is fine here since it's render-only
+            aimAngleCache.set(player.eid, Math.atan2(dy, dx) + Math.PI / 2);
         }
     };
 }
@@ -392,16 +395,19 @@ export function setupCollisions(
             furnitureBody.impulseX += pushX;
             furnitureBody.impulseY += pushY;
 
-            // Calculate and apply torque
-            const torque = (collisionX * pushY - collisionY * pushX) * 0.00001;
-            const massEffect = 3 / (furnitureBody.mass || 5);
-            const adjustedTorque = torque * massEffect;
-
-            const maxAngularVelocity = 0.5;
-            const currentAngVel = furnitureBody.angularVelocity || 0;
-            const newAngularVelocity = currentAngVel + adjustedTorque;
-            furnitureBody.angularVelocity = Math.max(-maxAngularVelocity,
-                Math.min(maxAngularVelocity, newAngularVelocity));
+            // DISABLED: Angular velocity modification causes desync
+            // The collision handler runs during physics step, but postPhysics
+            // overwrites Body2D.angularVelocity from physics body, losing our change.
+            // TODO: Add angularImpulse support to Body2D for proper torque application
+            //
+            // const torque = (collisionX * pushY - collisionY * pushX) * 0.00001;
+            // const massEffect = 3 / (furnitureBody.mass || 5);
+            // const adjustedTorque = torque * massEffect;
+            // const maxAngularVelocity = 0.5;
+            // const currentAngVel = furnitureBody.angularVelocity || 0;
+            // const newAngularVelocity = currentAngVel + adjustedTorque;
+            // furnitureBody.angularVelocity = Math.max(-maxAngularVelocity,
+            //     Math.min(maxAngularVelocity, newAngularVelocity));
         }
     });
 }
