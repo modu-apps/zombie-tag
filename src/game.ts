@@ -29,7 +29,7 @@ import {
 
 import type { GameConfig, SpriteCache } from './types';
 import { defineEntities, TeamComponent, GamePhaseComponent, TileData, FurnitureData } from './entities';
-import { setupSystems, setupCollisions, getGameStateEntity, getSortedPlayers } from './systems';
+import { setupSystems, setupCollisions, getGameStateEntity, getSortedPlayers, aimAngleCache } from './systems';
 import { createRenderer, createUIUpdater, loadSprites } from './render';
 
 // ============================================
@@ -53,22 +53,9 @@ let playerRadius: number;
 let WIDTH: number;
 let HEIGHT: number;
 
-// Manual key tracking (InputPlugin's deduplication rounds small values to 0)
-// The engine's inputToString rounds by 10, so -1/0/1 becomes 0
-const keysDown = new Set<string>();
-
-/**
- * Get scaled movement vector from tracked keys
- * Returns values like 100/-100 instead of 1/-1 to survive InputPlugin's rounding
- */
-function getMovementVector(): { x: number; y: number } {
-    let x = 0, y = 0;
-    if (keysDown.has('a') || keysDown.has('arrowleft')) x -= 100;
-    if (keysDown.has('d') || keysDown.has('arrowright')) x += 100;
-    if (keysDown.has('w') || keysDown.has('arrowup')) y -= 100;
-    if (keysDown.has('s') || keysDown.has('arrowdown')) y += 100;
-    return { x, y };
-}
+// Mouse tracking for aiming (same pattern as 2d-shooter)
+let mouseX: number;
+let mouseY: number;
 
 const spriteCache: SpriteCache = {
     sprites: new Map(),
@@ -228,7 +215,10 @@ function spawnPlayer(clientId: string): void {
 function despawnPlayer(clientId: string): void {
     const numericId = game.internClientId(clientId);
     const entity = game.getEntityByClientId(numericId);
-    entity?.destroy();
+    if (entity && !entity.destroyed) {
+        aimAngleCache.delete(entity.eid);
+        entity.destroy();
+    }
 }
 
 // ============================================
@@ -261,17 +251,13 @@ export async function initGame(): Promise<void> {
         HEIGHT = canvas.height;
     });
 
-    // Manual keyboard tracking - bypasses InputPlugin's deduplication issue
-    // The engine rounds input values by 10, so small values like -1/0/1 become 0
-    window.addEventListener('keydown', (e) => {
-        keysDown.add(e.key.toLowerCase());
-    });
-    window.addEventListener('keyup', (e) => {
-        keysDown.delete(e.key.toLowerCase());
-    });
-    // Clear keys when window loses focus to prevent stuck keys
-    window.addEventListener('blur', () => {
-        keysDown.clear();
+    // Mouse tracking for aiming (same pattern as 2d-shooter)
+    mouseX = WIDTH / 2;
+    mouseY = HEIGHT / 2;
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        mouseX = e.clientX - rect.left;
+        mouseY = e.clientY - rect.top;
     });
 
     // Create game instance
@@ -294,18 +280,25 @@ export async function initGame(): Promise<void> {
     document.getElementById('ui')!.style.display = 'block';
 
     // Setup input actions
-    // Movement input - uses manual key tracking with scaled values
-    // The callback returns values like 100/-100 which survive InputPlugin's rounding
+    // Movement input - use callback for full control over key mapping (same pattern as 2d-shooter)
     input.action('move', {
         type: 'vector',
-        bindings: [getMovementVector]
+        bindings: [() => {
+            let x = 0;
+            let y = 0;
+            if (input.isKeyDown('w') || input.isKeyDown('arrowup')) y -= 1;
+            if (input.isKeyDown('s') || input.isKeyDown('arrowdown')) y += 1;
+            if (input.isKeyDown('a') || input.isKeyDown('arrowleft')) x -= 1;
+            if (input.isKeyDown('d') || input.isKeyDown('arrowright')) x += 1;
+            return { x, y };
+        }]
     });
 
-    // Aim input - raw mouse position on canvas
+    // Aim input - raw mouse position on canvas (properly canvas-relative)
     // Direction is calculated in the aiming system relative to screen center
     input.action('aim', {
         type: 'vector',
-        bindings: ['mouse']
+        bindings: [() => ({ x: mouseX, y: mouseY })]
     });
 
     // Create camera entity
@@ -356,6 +349,14 @@ export async function initGame(): Promise<void> {
          * order matches room creator. This prevents physics divergence.
          */
         onSnapshot(entities: Entity[]) {
+            // Clean up aimAngleCache - remove entries for entities not in snapshot
+            const validEids = new Set(entities.filter(e => e.type === 'player' && !e.destroyed).map(e => e.eid));
+            for (const eid of aimAngleCache.keys()) {
+                if (!validEids.has(eid)) {
+                    aimAngleCache.delete(eid);
+                }
+            }
+
             // Find local player and center camera on them
             const localId = getLocalClientId();
             if (localId !== null) {
@@ -485,6 +486,23 @@ export async function initGame(): Promise<void> {
                     // Not enough players, go back to waiting
                     state.phase = PHASE_WAITING;
                 }
+            }
+        }
+    }, { phase: 'update' });
+
+    // Stale player cleanup system - removes players whose clients have disconnected
+    // This handles race conditions where disconnect is processed after reconnect
+    game.addSystem(() => {
+        const activeClientIds = new Set(
+            game.getClients().map(cid => game.internClientId(cid))
+        );
+
+        for (const player of game.query('player')) {
+            if (player.destroyed) continue;
+            const playerComp = player.get(Player);
+            if (!activeClientIds.has(playerComp.clientId)) {
+                aimAngleCache.delete(player.eid);
+                player.destroy();
             }
         }
     }, { phase: 'update' });

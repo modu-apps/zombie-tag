@@ -137,10 +137,8 @@ async function build() {
     }
 
     // Create/update index.html in dist
-    // Use local engine in development, CDN in CI
-    const engineScript = isCI
-        ? `<script>document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\\/script>');</script>`
-        : `<script src="http://localhost:3001/dist/modu.iife.js"></script>`;
+    // Always use CDN for engine
+    const engineScript = `<script>document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\\/script>');</script>`;
 
     const indexHtml = `<!DOCTYPE html>
 <html>

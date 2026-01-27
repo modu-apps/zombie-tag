@@ -179,17 +179,17 @@ var BrainsGame = (() => {
         if (!inputData?.aim)
           continue;
         const aim = inputData.aim;
-        let mouseX = centerX;
-        let mouseY = centerY;
+        let mouseX2 = centerX;
+        let mouseY2 = centerY;
         if (Array.isArray(aim)) {
-          mouseX = aim[0] || centerX;
-          mouseY = aim[1] || centerY;
+          mouseX2 = aim[0] || centerX;
+          mouseY2 = aim[1] || centerY;
         } else if (typeof aim === "object") {
-          mouseX = aim.x || centerX;
-          mouseY = aim.y || centerY;
+          mouseX2 = aim.x || centerX;
+          mouseY2 = aim.y || centerY;
         }
-        const dx = mouseX - centerX;
-        const dy = mouseY - centerY;
+        const dx = mouseX2 - centerX;
+        const dy = mouseY2 - centerY;
         aimAngleCache.set(player.eid, Math.atan2(dy, dx) + Math.PI / 2);
       }
     };
@@ -551,19 +551,8 @@ var BrainsGame = (() => {
   var playerRadius;
   var WIDTH;
   var HEIGHT;
-  var keysDown = /* @__PURE__ */ new Set();
-  function getMovementVector() {
-    let x = 0, y = 0;
-    if (keysDown.has("a") || keysDown.has("arrowleft"))
-      x -= 100;
-    if (keysDown.has("d") || keysDown.has("arrowright"))
-      x += 100;
-    if (keysDown.has("w") || keysDown.has("arrowup"))
-      y -= 100;
-    if (keysDown.has("s") || keysDown.has("arrowdown"))
-      y += 100;
-    return { x, y };
-  }
+  var mouseX;
+  var mouseY;
   var spriteCache = {
     sprites: /* @__PURE__ */ new Map(),
     tilesheetImg: null,
@@ -674,7 +663,10 @@ var BrainsGame = (() => {
   function despawnPlayer(clientId) {
     const numericId = game.internClientId(clientId);
     const entity = game.getEntityByClientId(numericId);
-    entity?.destroy();
+    if (entity && !entity.destroyed) {
+      aimAngleCache.delete(entity.eid);
+      entity.destroy();
+    }
   }
   async function initGame() {
     const res = await fetch("brains.json");
@@ -695,14 +687,12 @@ var BrainsGame = (() => {
       WIDTH = canvas.width;
       HEIGHT = canvas.height;
     });
-    window.addEventListener("keydown", (e) => {
-      keysDown.add(e.key.toLowerCase());
-    });
-    window.addEventListener("keyup", (e) => {
-      keysDown.delete(e.key.toLowerCase());
-    });
-    window.addEventListener("blur", () => {
-      keysDown.clear();
+    mouseX = WIDTH / 2;
+    mouseY = HEIGHT / 2;
+    canvas.addEventListener("mousemove", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mouseX = e.clientX - rect.left;
+      mouseY = e.clientY - rect.top;
     });
     game = (0, import_modu_engine4.createGame)();
     physics = game.addPlugin(import_modu_engine4.Physics2DSystem, { gravity: { x: 0, y: 0 } });
@@ -715,11 +705,23 @@ var BrainsGame = (() => {
     document.getElementById("ui").style.display = "block";
     input.action("move", {
       type: "vector",
-      bindings: [getMovementVector]
+      bindings: [() => {
+        let x = 0;
+        let y = 0;
+        if (input.isKeyDown("w") || input.isKeyDown("arrowup"))
+          y -= 1;
+        if (input.isKeyDown("s") || input.isKeyDown("arrowdown"))
+          y += 1;
+        if (input.isKeyDown("a") || input.isKeyDown("arrowleft"))
+          x -= 1;
+        if (input.isKeyDown("d") || input.isKeyDown("arrowright"))
+          x += 1;
+        return { x, y };
+      }]
     });
     input.action("aim", {
       type: "vector",
-      bindings: ["mouse"]
+      bindings: [() => ({ x: mouseX, y: mouseY })]
     });
     cameraEntity = game.spawn("camera");
     const cam = cameraEntity.get(import_modu_engine4.Camera2D);
@@ -764,6 +766,12 @@ var BrainsGame = (() => {
        * order matches room creator. This prevents physics divergence.
        */
       onSnapshot(entities) {
+        const validEids = new Set(entities.filter((e) => e.type === "player" && !e.destroyed).map((e) => e.eid));
+        for (const eid of aimAngleCache.keys()) {
+          if (!validEids.has(eid)) {
+            aimAngleCache.delete(eid);
+          }
+        }
         const localId = getLocalClientId();
         if (localId !== null) {
           for (const entity of entities) {
@@ -867,6 +875,20 @@ var BrainsGame = (() => {
           } else {
             state.phase = PHASE_WAITING;
           }
+        }
+      }
+    }, { phase: "update" });
+    game.addSystem(() => {
+      const activeClientIds = new Set(
+        game.getClients().map((cid) => game.internClientId(cid))
+      );
+      for (const player of game.query("player")) {
+        if (player.destroyed)
+          continue;
+        const playerComp = player.get(import_modu_engine4.Player);
+        if (!activeClientIds.has(playerComp.clientId)) {
+          aimAngleCache.delete(player.eid);
+          player.destroy();
         }
       }
     }, { phase: "update" });
