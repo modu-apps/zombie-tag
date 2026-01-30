@@ -222,6 +222,11 @@ function renderFurniture(
         ctx.fillRect(-w / 2, -h / 2, w, h);
     }
 
+    // DEBUG: Draw physics body outline (red box showing actual collision bounds)
+    // ctx.strokeStyle = 'red';
+    // ctx.lineWidth = 2;
+    // ctx.strokeRect(-w / 2, -h / 2, w, h);
+
     ctx.restore();
 }
 
@@ -236,39 +241,45 @@ function renderPlayer(
 ): void {
     const teamComp = entity.get(TeamComponent);
     const teamNum = teamComp.team;
+    const transform = entity.get(Transform2D);
 
     // Get team configuration
     const teamName = teamNum === TEAM_ZOMBIE ? 'zombie' : teamNum === TEAM_SICK ? 'sick' : 'human';
     const teamConfig = config.entityTypes.player[teamName];
     const sprite = spriteCache.sprites.get(teamConfig?.sprite || '');
     const color = teamConfig?.color || '#fff';
-    // Get aim angle from local cache (not synced to avoid floating-point desync)
-    const aimAngle = aimAngleCache.get(entity.eid) || 0;
+    // Use physics body angle for both sprite and debug draw (unified rotation)
+    const bodyAngle = transform ? transform.angle : 0;
 
     ctx.save();
     ctx.translate(pos.x, pos.y);
-    ctx.rotate(aimAngle);
+    ctx.rotate(bodyAngle);  // Use physics body angle for sprite
 
+    const playerSize = 40;  // Fixed 40x40 player size (matches entities.ts)
+    const halfSize = playerSize / 2;
     if (sprite) {
-        ctx.drawImage(sprite, -playerRadius, -playerRadius, playerRadius * 2, playerRadius * 2);
+        ctx.drawImage(sprite, -halfSize, -halfSize, playerSize, playerSize);
     } else {
-        // Fallback: colored circle
-        ctx.beginPath();
-        ctx.arc(0, 0, playerRadius, 0, Math.PI * 2);
+        // Fallback: colored rectangle (matches physics shape)
         ctx.fillStyle = color;
-        ctx.fill();
+        ctx.fillRect(-halfSize, -halfSize, playerSize, playerSize);
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 2;
-        ctx.stroke();
+        ctx.strokeRect(-halfSize, -halfSize, playerSize, playerSize);
 
         // Direction indicator
         ctx.fillStyle = '#fff';
         ctx.beginPath();
-        ctx.moveTo(playerRadius * 0.5, 0);
-        ctx.lineTo(playerRadius * 0.8, -playerRadius * 0.2);
-        ctx.lineTo(playerRadius * 0.8, playerRadius * 0.2);
+        ctx.moveTo(halfSize * 0.5, 0);
+        ctx.lineTo(halfSize * 0.8, -halfSize * 0.2);
+        ctx.lineTo(halfSize * 0.8, halfSize * 0.2);
         ctx.fill();
     }
+
+    // DEBUG: Draw physics body outline (lime box - same rotation as sprite now)
+    // ctx.strokeStyle = 'lime';
+    // ctx.lineWidth = 2;
+    // ctx.strokeRect(-halfSize, -halfSize, playerSize, playerSize);
 
     ctx.restore();
 }

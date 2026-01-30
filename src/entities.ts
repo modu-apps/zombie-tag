@@ -101,27 +101,40 @@ export function defineEntities(game: Game, tileSize: number, playerRadius: numbe
             shapeType: SHAPE_RECT,
             bodyType: BODY_DYNAMIC,
             mass: 5,
-            restitution: 0.2,
-            friction: 0.5,
-            damping: 0.15,
+            restitution: 0.01,  // Nearly zero bounce to reduce wall jitter
+            friction: 0.1,      // Low friction
+            damping: 0.8,       // High damping to settle quickly
             width: tileSize,
             height: tileSize
         })
         .with(FurnitureData)
         .register();
 
-    // Player - kinematic body with team data
+    // Player - dynamic body with high mass (Box2D-style character)
+    // Using dynamic instead of kinematic so physics naturally handles wall collisions
+    const playerSize = 40;  // Fixed 40x40 player size
     game.defineEntity('player')
         .with(Transform2D)
-        .with(Sprite, { shape: SHAPE_CIRCLE, radius: playerRadius, layer: 3 })
-        .with(Body2D, { shapeType: SHAPE_CIRCLE, radius: playerRadius, bodyType: BODY_KINEMATIC })
+        .with(Sprite, { shape: SHAPE_RECT, width: playerSize, height: playerSize, layer: 3 })
+        .with(Body2D, {
+            shapeType: SHAPE_RECT,
+            width: playerSize,
+            height: playerSize,
+            bodyType: BODY_DYNAMIC,
+            mass: 20,           // High mass - can push furniture (mass 5) easily
+            restitution: 0,     // No bounce
+            friction: 0.3,      // Some friction for control
+            damping: 0.1,       // Low damping for responsive movement
+            lockRotation: true  // Player rotation controlled by mouse, not physics
+        })
         .with(Player)
         .with(TeamComponent)
         .register();
 
     // Camera entity - client-only, excluded from snapshots
+    // zoom: 0.77 = see ~30% more of the map (zoomed out)
     game.defineEntity('camera')
-        .with(Camera2D, { smoothing: 0.5 })
+        .with(Camera2D, { smoothing: 0.5, zoom: 0.77, targetZoom: 0.77 })
         .syncNone()
         .register();
 }

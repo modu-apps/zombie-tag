@@ -143,7 +143,7 @@ export function createMovementSystem(
 // Aiming System
 // ============================================
 
-// Local aim angle cache - NOT synced to avoid floating-point desync
+// Local aim angle cache - kept for backwards compatibility but now also sets Transform2D.angle
 // Key: entity ID, Value: aim angle in radians
 export const aimAngleCache = new Map<number, number>();
 
@@ -177,8 +177,14 @@ export function createAimingSystem(game: Game, canvasWidth: number, canvasHeight
             const dx = mouseX - centerX;
             const dy = mouseY - centerY;
 
-            // Store in local cache (not synced) - Math.atan2 is fine here since it's render-only
-            aimAngleCache.set(player.eid, Math.atan2(dy, dx) + Math.PI / 2);
+            const angle = Math.atan2(dy, dx) + Math.PI / 2;
+
+            // Store in local cache for backwards compatibility
+            aimAngleCache.set(player.eid, angle);
+
+            // Also set Transform2D.angle so physics body and sprite both use it
+            const transform = player.get(Transform2D);
+            transform.angle = angle;
         }
     };
 }
@@ -391,23 +397,10 @@ export function setupCollisions(
             const pushX = (dx / dist) * pushStrength;
             const pushY = (dy / dist) * pushStrength;
 
-            // Apply linear impulse
+            // Apply linear impulse only - angular impulse is now handled by
+            // the physics engine's friction system at proper contact points
             furnitureBody.impulseX += pushX;
             furnitureBody.impulseY += pushY;
-
-            // DISABLED: Angular velocity modification causes desync
-            // The collision handler runs during physics step, but postPhysics
-            // overwrites Body2D.angularVelocity from physics body, losing our change.
-            // TODO: Add angularImpulse support to Body2D for proper torque application
-            //
-            // const torque = (collisionX * pushY - collisionY * pushX) * 0.00001;
-            // const massEffect = 3 / (furnitureBody.mass || 5);
-            // const adjustedTorque = torque * massEffect;
-            // const maxAngularVelocity = 0.5;
-            // const currentAngVel = furnitureBody.angularVelocity || 0;
-            // const newAngularVelocity = currentAngVel + adjustedTorque;
-            // furnitureBody.angularVelocity = Math.max(-maxAngularVelocity,
-            //     Math.min(maxAngularVelocity, newAngularVelocity));
         }
     });
 }
