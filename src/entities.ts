@@ -112,7 +112,7 @@ export function defineEntities(game: Game, tileSize: number, playerRadius: numbe
 
     // Player - dynamic body with high mass (Box2D-style character)
     // Using dynamic instead of kinematic so physics naturally handles wall collisions
-    const playerSize = playerRadius * 2;  // Convert radius to diameter for rect size
+    const playerSize = 40;  // Fixed 40x40 player size
     game.defineEntity('player')
         .with(Transform2D)
         .with(Sprite, { shape: SHAPE_RECT, width: playerSize, height: playerSize, layer: 3 })
@@ -132,8 +132,9 @@ export function defineEntities(game: Game, tileSize: number, playerRadius: numbe
         .register();
 
     // Camera entity - client-only, excluded from snapshots
+    // zoom: 0.77 = see ~30% more of the map (zoomed out)
     game.defineEntity('camera')
-        .with(Camera2D, { smoothing: 0.5 })
+        .with(Camera2D, { smoothing: 0.5, zoom: 0.77, targetZoom: 0.77 })
         .syncNone()
         .register();
 }

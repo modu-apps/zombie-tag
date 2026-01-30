@@ -255,30 +255,31 @@ function renderPlayer(
     ctx.translate(pos.x, pos.y);
     ctx.rotate(bodyAngle);  // Use physics body angle for sprite
 
-    const playerSize = playerRadius * 2;  // Full size (radius was half-size)
+    const playerSize = 40;  // Fixed 40x40 player size (matches entities.ts)
+    const halfSize = playerSize / 2;
     if (sprite) {
-        ctx.drawImage(sprite, -playerRadius, -playerRadius, playerSize, playerSize);
+        ctx.drawImage(sprite, -halfSize, -halfSize, playerSize, playerSize);
     } else {
         // Fallback: colored rectangle (matches physics shape)
         ctx.fillStyle = color;
-        ctx.fillRect(-playerRadius, -playerRadius, playerSize, playerSize);
+        ctx.fillRect(-halfSize, -halfSize, playerSize, playerSize);
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 2;
-        ctx.strokeRect(-playerRadius, -playerRadius, playerSize, playerSize);
+        ctx.strokeRect(-halfSize, -halfSize, playerSize, playerSize);
 
         // Direction indicator
         ctx.fillStyle = '#fff';
         ctx.beginPath();
-        ctx.moveTo(playerRadius * 0.5, 0);
-        ctx.lineTo(playerRadius * 0.8, -playerRadius * 0.2);
-        ctx.lineTo(playerRadius * 0.8, playerRadius * 0.2);
+        ctx.moveTo(halfSize * 0.5, 0);
+        ctx.lineTo(halfSize * 0.8, -halfSize * 0.2);
+        ctx.lineTo(halfSize * 0.8, halfSize * 0.2);
         ctx.fill();
     }
 
     // DEBUG: Draw physics body outline (lime box - same rotation as sprite now)
     // ctx.strokeStyle = 'lime';
     // ctx.lineWidth = 2;
-    // ctx.strokeRect(-playerRadius, -playerRadius, playerSize, playerSize);
+    // ctx.strokeRect(-halfSize, -halfSize, playerSize, playerSize);
 
     ctx.restore();
 }
