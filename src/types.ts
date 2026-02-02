@@ -81,7 +81,7 @@ export interface MapLayer {
 }
 
 export interface TilesetConfig {
-    localImage: string;
+    image: string;
     columns: number;
 }
 

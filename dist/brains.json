@@ -25,7 +25,7 @@
       "player": {
         "human": {
           "name": "Human",
-          "sprite": "human.png",
+          "sprite": "https://s3-us-west-1.amazonaws.com/modd/halloween-0.18/spritesheet/man.png",
           "color": "#4ecdc4",
           "width": 0.5,
           "height": 0.5,
@@ -36,7 +36,7 @@
         },
         "zombie": {
           "name": "Zombie",
-          "sprite": "zombie.png",
+          "sprite": "https://cache.modd.io/asset/spriteImage/1583890829570_human.png",
           "color": "#e94560",
           "width": 0.5,
           "height": 0.5,
@@ -47,7 +47,7 @@
         },
         "sick": {
           "name": "Sick",
-          "sprite": "sick.png",
+          "sprite": "https://cache.modd.io/asset/spriteImage/1583890806756_human.png",
           "color": "#ff9f43",
           "width": 0.5,
           "height": 0.5,
@@ -226,7 +226,6 @@
           "columns": 27,
           "firstgid": 1,
           "image": "https://cache.modd.io/asset/spriteImage/1763501136378_tilesheet_complete.png",
-          "localImage": "tilesheet.png",
           "imageheight": 1280,
           "imagewidth": 1728,
           "margin": 0,

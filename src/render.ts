@@ -350,7 +350,7 @@ export async function loadSprites(
     // Load tilesheet
     const tilesheetInfo = config.map.tilesets?.[0];
     if (tilesheetInfo) {
-        const img = await loadSprite(tilesheetInfo.localImage);
+        const img = await loadSprite(tilesheetInfo.image);
         spriteCache.tilesheetImg = img;
         spriteCache.tileCols = tilesheetInfo.columns || 1;
     }

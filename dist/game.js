@@ -94,14 +94,33 @@ var BrainsGame = (() => {
       shapeType: import_modu_engine.SHAPE_RECT,
       bodyType: import_modu_engine.BODY_DYNAMIC,
       mass: 5,
-      restitution: 0.2,
-      friction: 0.5,
-      damping: 0.15,
+      restitution: 0.01,
+      // Nearly zero bounce to reduce wall jitter
+      friction: 0.1,
+      // Low friction
+      damping: 0.8,
+      // High damping to settle quickly
       width: tileSize2,
       height: tileSize2
     }).with(FurnitureData).register();
-    game2.defineEntity("player").with(import_modu_engine.Transform2D).with(import_modu_engine.Sprite, { shape: import_modu_engine.SHAPE_CIRCLE, radius: playerRadius2, layer: 3 }).with(import_modu_engine.Body2D, { shapeType: import_modu_engine.SHAPE_CIRCLE, radius: playerRadius2, bodyType: import_modu_engine.BODY_KINEMATIC }).with(import_modu_engine.Player).with(TeamComponent).register();
-    game2.defineEntity("camera").with(import_modu_engine.Camera2D, { smoothing: 0.5 }).syncNone().register();
+    const playerSize = 40;
+    game2.defineEntity("player").with(import_modu_engine.Transform2D).with(import_modu_engine.Sprite, { shape: import_modu_engine.SHAPE_RECT, width: playerSize, height: playerSize, layer: 3 }).with(import_modu_engine.Body2D, {
+      shapeType: import_modu_engine.SHAPE_RECT,
+      width: playerSize,
+      height: playerSize,
+      bodyType: import_modu_engine.BODY_DYNAMIC,
+      mass: 20,
+      // High mass - can push furniture (mass 5) easily
+      restitution: 0,
+      // No bounce
+      friction: 0.3,
+      // Some friction for control
+      damping: 0.1,
+      // Low damping for responsive movement
+      lockRotation: true
+      // Player rotation controlled by mouse, not physics
+    }).with(import_modu_engine.Player).with(TeamComponent).register();
+    game2.defineEntity("camera").with(import_modu_engine.Camera2D, { smoothing: 0.5, zoom: 0.77, targetZoom: 0.77 }).syncNone().register();
   }
 
   // src/systems.ts
@@ -190,7 +209,10 @@ var BrainsGame = (() => {
         }
         const dx = mouseX2 - centerX;
         const dy = mouseY2 - centerY;
-        aimAngleCache.set(player.eid, Math.atan2(dy, dx) + Math.PI / 2);
+        const angle = Math.atan2(dy, dx) + Math.PI / 2;
+        aimAngleCache.set(player.eid, angle);
+        const transform = player.get(import_modu_engine2.Transform2D);
+        transform.angle = angle;
       }
     };
   }
@@ -449,29 +471,30 @@ var BrainsGame = (() => {
   function renderPlayer(ctx, game2, entity, pos, config2, playerRadius2, spriteCache2) {
     const teamComp = entity.get(TeamComponent);
     const teamNum = teamComp.team;
+    const transform = entity.get(import_modu_engine3.Transform2D);
     const teamName = teamNum === TEAM_ZOMBIE ? "zombie" : teamNum === TEAM_SICK ? "sick" : "human";
     const teamConfig = config2.entityTypes.player[teamName];
     const sprite = spriteCache2.sprites.get(teamConfig?.sprite || "");
     const color = teamConfig?.color || "#fff";
-    const aimAngle = aimAngleCache.get(entity.eid) || 0;
+    const bodyAngle = transform ? transform.angle : 0;
     ctx.save();
     ctx.translate(pos.x, pos.y);
-    ctx.rotate(aimAngle);
+    ctx.rotate(bodyAngle);
+    const playerSize = 40;
+    const halfSize = playerSize / 2;
     if (sprite) {
-      ctx.drawImage(sprite, -playerRadius2, -playerRadius2, playerRadius2 * 2, playerRadius2 * 2);
+      ctx.drawImage(sprite, -halfSize, -halfSize, playerSize, playerSize);
     } else {
-      ctx.beginPath();
-      ctx.arc(0, 0, playerRadius2, 0, Math.PI * 2);
       ctx.fillStyle = color;
-      ctx.fill();
+      ctx.fillRect(-halfSize, -halfSize, playerSize, playerSize);
       ctx.strokeStyle = "#fff";
       ctx.lineWidth = 2;
-      ctx.stroke();
+      ctx.strokeRect(-halfSize, -halfSize, playerSize, playerSize);
       ctx.fillStyle = "#fff";
       ctx.beginPath();
-      ctx.moveTo(playerRadius2 * 0.5, 0);
-      ctx.lineTo(playerRadius2 * 0.8, -playerRadius2 * 0.2);
-      ctx.lineTo(playerRadius2 * 0.8, playerRadius2 * 0.2);
+      ctx.moveTo(halfSize * 0.5, 0);
+      ctx.lineTo(halfSize * 0.8, -halfSize * 0.2);
+      ctx.lineTo(halfSize * 0.8, halfSize * 0.2);
       ctx.fill();
     }
     ctx.restore();
@@ -520,7 +543,7 @@ var BrainsGame = (() => {
     };
     const tilesheetInfo = config2.map.tilesets?.[0];
     if (tilesheetInfo) {
-      const img = await loadSprite(tilesheetInfo.localImage);
+      const img = await loadSprite(tilesheetInfo.image);
       spriteCache2.tilesheetImg = img;
       spriteCache2.tileCols = tilesheetInfo.columns || 1;
     }

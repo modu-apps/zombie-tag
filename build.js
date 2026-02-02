@@ -129,16 +129,30 @@ async function build() {
     }
 
     // Copy assets to dist
-    const assetsTocp = ['brains.json', 'human.png', 'sick.png', 'zombie.png', 'tilesheet.png'];
+    const assetsTocp = ['brains.json'];
     for (const asset of assetsTocp) {
         if (fs.existsSync(asset)) {
             fs.copyFileSync(asset, `dist/${asset}`);
         }
     }
 
+    // Copy local engine from parent directory (if not CI)
+    if (!isCI) {
+        const localEnginePath = path.join(__dirname, '../../engine/dist/modu.iife.js');
+        if (fs.existsSync(localEnginePath)) {
+            fs.copyFileSync(localEnginePath, 'dist/modu-local.js');
+            console.log('[build] Copied local engine from ../../engine/dist/modu.iife.js');
+        } else {
+            console.warn('[build] WARNING: Local engine not found at', localEnginePath);
+        }
+    }
+
     // Create/update index.html in dist
-    // Always use CDN for engine
-    const engineScript = `<script>document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\\/script>');</script>`;
+    // TEMP: Force CDN to test if desync is from local changes
+    const forceCDN = false;
+    const engineScript = (isCI || forceCDN)
+        ? `<script>document.write('<script src="https://cdn.moduengine.com/modu.min.js?v=' + Date.now() + '"><\\/script>');</script>`
+        : `<script src="modu-local.js?v=${Date.now()}"></script>`;
 
     const indexHtml = `<!DOCTYPE html>
 <html>
